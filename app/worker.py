@@ -19,9 +19,12 @@ async def _resolve_and_save(mmsi: int, name: str | None) -> None:
         name, imo = resolved
         await asyncio.to_thread(db.set_guessed_name, mmsi, name, imo)
         logger.info("Guessed name for mmsi=%s from MMSI search: %r (unverified)", mmsi, name)
+    else:
+        row = await asyncio.to_thread(db.get_vessel, mmsi)
+        imo = row["imo"] if row else None
 
     try:
-        result = await asyncio.to_thread(resolve_air_draft, name)
+        result = await asyncio.to_thread(resolve_air_draft, name, imo)
     except LookupError:
         logger.warning("Lookup failed for %r (mmsi=%s), will retry later", name, mmsi)
         return
@@ -84,5 +87,30 @@ async def run_stale_unknown_requeue(queue: asyncio.Queue) -> None:
             if row["mmsi"] not in IN_FLIGHT:
                 IN_FLIGHT.add(row["mmsi"])
                 await queue.put((row["mmsi"], row["name"]))
+
+        await asyncio.sleep(STALE_SWEEP_INTERVAL_SECONDS)
+
+
+async def run_imo_backfill() -> None:
+    """Fills in IMO for vessels whose name is already known but whose IMO
+    never arrived: Class B craft (tugs, pilot boats, salvage barges, etc.)
+    broadcast via StaticDataReport, which has no IMO field at all (see
+    ais_client.py) - so ShipStaticData, the only message type that carries
+    one, is simply never coming for them. Reuses resolve_vessel_name's
+    confirmed MMSI-in-URL/title matching, which already recovers IMO
+    alongside name - it's just never invoked once the name half is already
+    known. Runs independently of the main lookup queue: an IMO patch
+    shouldn't trigger, or wait behind, a re-resolve of an already-resolved
+    air draft status."""
+    while True:
+        for row in await asyncio.to_thread(
+            db.get_vessels_needing_imo_lookup, config.SILENCE_WINDOW_MINUTES
+        ):
+            resolved = await asyncio.to_thread(resolve_vessel_name, row["mmsi"])
+            if resolved is not None:
+                _, imo = resolved
+                if imo is not None:
+                    await asyncio.to_thread(db.set_imo, row["mmsi"], imo)
+                    logger.info("Backfilled IMO for mmsi=%s: %s", row["mmsi"], imo)
 
         await asyncio.sleep(STALE_SWEEP_INTERVAL_SECONDS)

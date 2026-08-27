@@ -8,7 +8,7 @@ from fastapi.templating import Jinja2Templates
 
 from app import config, db
 from app.ais_client import run_ingestion
-from app.worker import run_lookup_worker, run_stale_unknown_requeue
+from app.worker import run_imo_backfill, run_lookup_worker, run_stale_unknown_requeue
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -25,6 +25,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(run_lookup_worker(queue)) for _ in range(config.LOOKUP_CONCURRENCY)
     ]
     tasks.append(asyncio.create_task(run_stale_unknown_requeue(queue)))
+    tasks.append(asyncio.create_task(run_imo_backfill()))
 
     yield
 

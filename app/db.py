@@ -132,6 +132,21 @@ def set_guessed_name(mmsi: int, name: str, imo: int | None) -> None:
     conn.commit()
 
 
+def set_imo(mmsi: int, imo: int) -> None:
+    """Stores an IMO recovered via worker.run_imo_backfill (see its docstring
+    for why this is needed - Class B craft never broadcast IMO at all, even
+    once their name is known). Only applies if the vessel still has no IMO -
+    if AIS's own static-data broadcast (upsert_static_data) already set one
+    in the meantime, that's authoritative and this is a no-op."""
+    now = _utcnow_iso()
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE vessels SET imo = ?, updated_at = ? WHERE mmsi = ? AND imo IS NULL",
+        (imo, now, mmsi),
+    )
+    conn.commit()
+
+
 def save_lookup_result(
     mmsi: int,
     status: str,
@@ -204,6 +219,21 @@ def get_vessels_needing_initial_lookup(silence_window_minutes: float) -> list[sq
         SELECT mmsi, name FROM vessels
         WHERE air_draft_status = 'PENDING' AND name IS NOT NULL AND last_checked_at IS NULL
           AND last_position_at >= ?
+        """,
+        (position_cutoff,),
+    ).fetchall()
+
+
+def get_vessels_needing_imo_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
+    """Vessels whose name is known but whose IMO never arrived - see
+    worker.run_imo_backfill for why. Scoped to the same silence window as
+    dashboard visibility, same reasoning as get_vessels_needing_initial_lookup."""
+    position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    conn = _get_conn()
+    return conn.execute(
+        """
+        SELECT mmsi FROM vessels
+        WHERE imo IS NULL AND name IS NOT NULL AND last_position_at >= ?
         """,
         (position_cutoff,),
     ).fetchall()
