@@ -1,0 +1,11 @@
+requests
+beautifulsoup4
+pypdf
+pymupdf
+pytesseract
+pillow
+websockets
+python-dotenv
+fastapi
+uvicorn[standard]
+jinja2

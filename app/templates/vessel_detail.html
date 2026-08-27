@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ vessel.name }} - AIS Air Draft Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; background: #0e1116; color: #e6e6e6; }
+  a { color: #7db4ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .back-link { display: inline-block; margin-bottom: 1rem; font-size: 0.9rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 0.2rem; }
+  .subtitle { color: #9aa4b2; font-size: 0.9rem; margin-bottom: 1.4rem; }
+  .layout { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
+  #map { flex: 2 1 480px; min-width: 300px; height: 480px; border-radius: 8px; border: 1px solid #232833; background: #161b22; }
+  .info-panel { flex: 1 1 260px; min-width: 240px; background: #161b22; border: 1px solid #232833; border-radius: 8px; padding: 1rem 1.2rem; }
+  .info-panel dl { margin: 0; }
+  .info-panel dt { color: #9aa4b2; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.9rem; }
+  .info-panel dt:first-child { margin-top: 0; }
+  .info-panel dd { margin: 0.15rem 0 0; font-size: 0.95rem; }
+  .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-PENDING { background: #2b3038; color: #9aa4b2; }
+  .badge-OK { background: #14351f; color: #4ade80; }
+  .badge-FLAGGED { background: #3a1414; color: #f87171; }
+  .badge-UNKNOWN { background: #3a2e0f; color: #fbbf24; }
+  .name-guessed { color: #fbbf24; cursor: help; margin-left: 0.4rem; font-size: 0.75em; vertical-align: middle; }
+  .legend { margin-top: 1rem; font-size: 0.8rem; color: #9aa4b2; }
+  .legend span { display: inline-flex; align-items: center; gap: 0.4rem; margin-right: 1.2rem; }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+  .swatch-marker { background: #f87171; }
+  .swatch-bbox { border: 2px dashed #e930ff; box-sizing: border-box; }
+  .no-position { padding: 1rem; color: #9aa4b2; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+  <a class="back-link" href="/">&larr; Back to dashboard</a>
+  <h1>{{ vessel.name }}{% if vessel.name_guessed %}<span class="name-guessed" title="Name resolved via MMSI web search, not confirmed by AIS - please double-check">&#9888; unverified name</span>{% endif %}</h1>
+  <div class="subtitle">MMSI {{ vessel.mmsi }}{% if vessel.imo %} &middot; IMO {{ vessel.imo }}{% endif %}</div>
+
+  <div class="layout">
+    <div id="map"></div>
+
+    <div class="info-panel">
+      <dl>
+        <dt>Status</dt>
+        <dd><span class="badge badge-{{ vessel.status }}">{{ vessel.status }}</span></dd>
+
+        <dt>MMSI</dt>
+        <dd>{{ vessel.mmsi }}</dd>
+
+        <dt>IMO</dt>
+        <dd>{{ vessel.imo or "—" }}</dd>
+
+        <dt>Name source</dt>
+        <dd>{% if vessel.name_guessed %}MMSI web search (unverified){% else %}AIS static data{% endif %}</dd>
+
+        <dt>Position</dt>
+        <dd>{{ "%.4f, %.4f"|format(vessel.lat, vessel.lon) if vessel.lat is not none else "—" }}</dd>
+
+        <dt>Last seen</dt>
+        <dd>{{ vessel.last_position_at or "—" }}</dd>
+
+        <dt>Air draft</dt>
+        <dd>{{ "%.2f m / %.1f ft"|format(vessel.value_m, vessel.value_ft) if vessel.value_m is not none else "—" }}
+          <span style="color:#9aa4b2;">(flag threshold: {{ threshold_ft }} ft)</span></dd>
+
+        <dt>Last checked</dt>
+        <dd>{{ vessel.last_checked_at or "never" }}</dd>
+
+        <dt>Source</dt>
+        <dd>{% if vessel.source_url %}<a href="{{ vessel.source_url }}" target="_blank" rel="noopener">{{ vessel.source_title or "link" }}</a>{% else %}—{% endif %}</dd>
+      </dl>
+
+      <div class="legend">
+        <span><i class="swatch swatch-marker"></i>Vessel</span>
+        <span><i class="swatch swatch-bbox"></i>Monitoring zone</span>
+      </div>
+    </div>
+  </div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+  const vessel = {{ vessel | tojson }};
+  const bbox = {{ bounding_box | tojson }};
+
+  const map = L.map('map');
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+
+  const bboxBounds = [[bbox[0][0], bbox[0][1]], [bbox[1][0], bbox[1][1]]];
+  L.rectangle(bboxBounds, { color: '#e930ff', weight: 3, fill: false, dashArray: '8, 6' }).addTo(map);
+
+  const fitBounds = L.latLngBounds(bboxBounds);
+
+  if (vessel.lat != null && vessel.lon != null) {
+    const marker = L.circleMarker([vessel.lat, vessel.lon], {
+      radius: 7, color: '#f87171', weight: 2, fillColor: '#f87171', fillOpacity: 0.8
+    }).addTo(map);
+    marker.bindPopup(`${vessel.name}<br>${vessel.lat.toFixed(4)}, ${vessel.lon.toFixed(4)}`);
+    fitBounds.extend([vessel.lat, vessel.lon]);
+  } else {
+    const note = document.createElement('div');
+    note.className = 'no-position';
+    note.textContent = 'No position data available for this vessel yet.';
+    document.getElementById('map').before(note);
+  }
+
+  map.fitBounds(fitBounds, { padding: [30, 30] });
+</script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+import asyncio
+import logging
+
+from app import config, db
+from app.air_draft_resolver import LookupError, resolve_air_draft, resolve_vessel_name
+from app.state import IN_FLIGHT
+
+logger = logging.getLogger(__name__)
+
+STALE_SWEEP_INTERVAL_SECONDS = 600
+
+
+async def _resolve_and_save(mmsi: int, name: str | None) -> None:
+    if name is None:
+        resolved = await asyncio.to_thread(resolve_vessel_name, mmsi)
+        if resolved is None:
+            logger.warning("Could not resolve a name for mmsi=%s from MMSI alone, will retry later", mmsi)
+            return
+        name, imo = resolved
+        await asyncio.to_thread(db.set_guessed_name, mmsi, name, imo)
+        logger.info("Guessed name for mmsi=%s from MMSI search: %r (unverified)", mmsi, name)
+
+    try:
+        result = await asyncio.to_thread(resolve_air_draft, name)
+    except LookupError:
+        logger.warning("Lookup failed for %r (mmsi=%s), will retry later", name, mmsi)
+        return
+    except Exception:
+        logger.exception("Unexpected error resolving air draft for %r (mmsi=%s)", name, mmsi)
+        return
+
+    await asyncio.to_thread(
+        db.save_lookup_result,
+        mmsi,
+        result.status,
+        result.value_raw,
+        result.value_m,
+        result.value_ft,
+        result.source_url,
+        result.source_title,
+        result.context,
+    )
+    logger.info("Resolved %r (mmsi=%s): %s", name, mmsi, result.status)
+
+
+async def run_lookup_worker(queue: asyncio.Queue) -> None:
+    while True:
+        mmsi, name = await queue.get()
+        try:
+            await _resolve_and_save(mmsi, name)
+        finally:
+            IN_FLIGHT.discard(mmsi)
+            queue.task_done()
+
+
+async def run_stale_unknown_requeue(queue: asyncio.Queue) -> None:
+    """Recovers PENDING vessels (e.g. after a restart, or a prior lookup that
+    failed outright and was left PENDING), retries UNKNOWN vessels older
+    than config.UNKNOWN_RETRY_HOURS, and retries vessels that still have no
+    name at all (AIS hasn't delivered a static-data message for them - see
+    resolve_vessel_name). All three are scoped to vessels still within
+    SILENCE_WINDOW_MINUTES - a vessel that's gone quiet longer than that is no
+    longer shown on the dashboard, so retrying it would just waste a lookup
+    worker on a vessel nobody can currently see. Runs once immediately, then
+    on a fixed interval."""
+    while True:
+        for row in await asyncio.to_thread(
+            db.get_vessels_needing_name_lookup, config.SILENCE_WINDOW_MINUTES
+        ):
+            if row["mmsi"] not in IN_FLIGHT:
+                IN_FLIGHT.add(row["mmsi"])
+                await queue.put((row["mmsi"], None))
+
+        for row in await asyncio.to_thread(
+            db.get_vessels_needing_initial_lookup, config.SILENCE_WINDOW_MINUTES
+        ):
+            if row["mmsi"] not in IN_FLIGHT:
+                IN_FLIGHT.add(row["mmsi"])
+                await queue.put((row["mmsi"], row["name"]))
+
+        for row in await asyncio.to_thread(
+            db.get_stale_unknown_vessels, config.UNKNOWN_RETRY_HOURS, config.SILENCE_WINDOW_MINUTES
+        ):
+            if row["mmsi"] not in IN_FLIGHT:
+                IN_FLIGHT.add(row["mmsi"])
+                await queue.put((row["mmsi"], row["name"]))
+
+        await asyncio.sleep(STALE_SWEEP_INTERVAL_SECONDS)

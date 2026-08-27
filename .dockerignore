@@ -1,0 +1,9 @@
+.git
+.env
+__pycache__
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+air_draft_summary_*.txt
+aisstream api key.txt

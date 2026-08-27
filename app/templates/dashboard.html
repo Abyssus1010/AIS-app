@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AIS Air Draft Monitor</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; background: #0e1116; color: #e6e6e6; }
+  h1 { font-size: 1.3rem; margin-bottom: 0.2rem; }
+  .subtitle { color: #9aa4b2; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.5rem 0.8rem; border-bottom: 1px solid #232833; font-size: 0.9rem; }
+  th { color: #9aa4b2; font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.03em; }
+  tr:hover { background: #161b22; }
+  .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-PENDING { background: #2b3038; color: #9aa4b2; }
+  .badge-OK { background: #14351f; color: #4ade80; }
+  .badge-FLAGGED { background: #3a1414; color: #f87171; }
+  .badge-UNKNOWN { background: #3a2e0f; color: #fbbf24; }
+  .name-guessed { color: #fbbf24; cursor: help; margin-left: 0.3rem; }
+  a { color: #7db4ff; }
+  .empty { color: #9aa4b2; padding: 2rem 0; text-align: center; }
+</style>
+</head>
+<body>
+  <h1>AIS Air Draft Monitor</h1>
+  <div class="subtitle">
+    Flagging vessels with air draft &gt; {{ threshold_ft }} ft &middot;
+    showing vessels seen in the last {{ silence_window_minutes|int }} min
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>MMSI</th>
+        <th>IMO</th>
+        <th>Position</th>
+        <th>Last seen</th>
+        <th>Status</th>
+        <th>Air draft</th>
+        <th>Last checked</th>
+        <th>Source</th>
+      </tr>
+    </thead>
+    <tbody id="vessel-body">
+      {% if not vessels %}
+      <tr><td colspan="9" class="empty">No vessels currently in range</td></tr>
+      {% endif %}
+      {% for v in vessels %}
+      <tr>
+        <td><a href="/vessel/{{ v.mmsi }}">{{ v.name }}</a>{% if v.name_guessed %}<span class="name-guessed" title="Name resolved via MMSI web search, not confirmed by AIS - please double-check">&#9888;</span>{% endif %}</td>
+        <td>{{ v.mmsi }}</td>
+        <td>{{ v.imo or "—" }}</td>
+        <td>{{ "%.4f, %.4f"|format(v.lat, v.lon) if v.lat is not none else "—" }}</td>
+        <td>{{ v.last_position_at or "—" }}</td>
+        <td><span class="badge badge-{{ v.status }}">{{ v.status }}</span></td>
+        <td>{{ "%.2f m / %.1f ft"|format(v.value_m, v.value_ft) if v.value_m is not none else "—" }}</td>
+        <td>{{ v.last_checked_at or "never" }}</td>
+        <td>{% if v.source_url %}<a href="{{ v.source_url }}" target="_blank" rel="noopener">{{ v.source_title or "link" }}</a>{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+<script>
+function badge(status) {
+  return `<span class="badge badge-${status}">${status}</span>`;
+}
+
+function fmtAgo(iso) {
+  if (!iso) return "never";
+  const then = new Date(iso).getTime();
+  const diffMin = Math.max(0, Math.round((Date.now() - then) / 60000));
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin} min ago`;
+  return `${Math.round(diffMin / 60)} hr ago`;
+}
+
+function fmtAirDraft(v) {
+  if (v.value_m == null) return "—";
+  return `${v.value_m.toFixed(2)} m / ${v.value_ft.toFixed(1)} ft`;
+}
+
+function render(vessels) {
+  const body = document.getElementById("vessel-body");
+  if (!vessels.length) {
+    body.innerHTML = `<tr><td colspan="9" class="empty">No vessels currently in range</td></tr>`;
+    return;
+  }
+  body.innerHTML = vessels.map(v => `
+    <tr>
+      <td><a href="/vessel/${v.mmsi}">${v.name}</a>${v.name_guessed ? `<span class="name-guessed" title="Name resolved via MMSI web search, not confirmed by AIS - please double-check">&#9888;</span>` : ""}</td>
+      <td>${v.mmsi}</td>
+      <td>${v.imo ?? "—"}</td>
+      <td>${v.lat != null ? v.lat.toFixed(4) + ", " + v.lon.toFixed(4) : "—"}</td>
+      <td>${fmtAgo(v.last_position_at)}</td>
+      <td>${badge(v.status)}</td>
+      <td>${fmtAirDraft(v)}</td>
+      <td>${fmtAgo(v.last_checked_at)}</td>
+      <td>${v.source_url ? `<a href="${v.source_url}" target="_blank" rel="noopener">${v.source_title ?? "link"}</a>` : "—"}</td>
+    </tr>
+  `).join("");
+}
+
+async function poll() {
+  try {
+    const resp = await fetch("/api/vessels");
+    const vessels = await resp.json();
+    render(vessels);
+  } catch (e) {
+    console.error("poll failed", e);
+  }
+}
+
+setInterval(poll, 10000);
+</script>
+</body>
+</html>
