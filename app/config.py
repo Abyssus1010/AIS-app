@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 API_KEY = os.environ["AISSTREAM_API_KEY"]
+LANGSEARCH_API_KEY = os.environ["LANGSEARCH_API_KEY"]
 
 # Monitoring zone: the smallest rectangle enclosing a +/-30deg cone that
 # extends 10 NM south from Changi's easternmost runway (02R/20L southern
@@ -23,6 +24,6 @@ AIR_DRAFT_THRESHOLD_FT = float(os.environ.get("AIR_DRAFT_THRESHOLD_FT", 70))
 SILENCE_WINDOW_MINUTES = float(os.environ.get("SILENCE_WINDOW_MINUTES", 30))
 UNKNOWN_RETRY_HOURS = float(os.environ.get("UNKNOWN_RETRY_HOURS", 1))
 LOOKUP_CONCURRENCY = int(os.environ.get("LOOKUP_CONCURRENCY", 3))
-DDG_REQUEST_DELAY_SECONDS = float(os.environ.get("DDG_REQUEST_DELAY_SECONDS", 2.0))
+SEARCH_REQUEST_DELAY_SECONDS = float(os.environ.get("SEARCH_REQUEST_DELAY_SECONDS", 2.0))
 
 DB_PATH = os.environ.get("DB_PATH", "./ais.db")

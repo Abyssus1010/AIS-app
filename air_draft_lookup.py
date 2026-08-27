@@ -13,7 +13,12 @@ it does show up in places like:
 
 So instead of a hardcoded source list, this script:
   1. Runs a handful of web searches for "<vessel name> ... air draft / ship
-     particulars" (DuckDuckGo HTML endpoint - no API key needed).
+     particulars" via LangSearch's Web Search API (https://langsearch.com).
+     Originally used DuckDuckGo's HTML endpoint (no key needed), but
+     html.duckduckgo.com turned out to be unreachable outright (refused/timed
+     out) from every network tested, and a keyed API beats scraping an
+     undocumented HTML selector anyway. Needs LANGSEARCH_API_KEY in the
+     environment (e.g. via a .env file - see .env.example).
   2. Fetches whatever comes back, PDF or HTML alike.
   3. Scans the extracted text for air-draft-related lines.
 
@@ -55,8 +60,12 @@ import pymupdf
 import pytesseract
 import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from PIL import Image
 from pypdf import PdfReader
+
+load_dotenv()
+LANGSEARCH_API_KEY = os.environ["LANGSEARCH_API_KEY"]
 
 _conda_library = os.path.join(os.path.dirname(sys.executable), "Library")
 _conda_tesseract_exe = os.path.join(_conda_library, "bin", "tesseract.exe")
@@ -107,35 +116,39 @@ AIR_DRAFT_KEYWORDS = [
 VALUE_PATTERN = re.compile(r"(\d[\d,]*\.?\d*)\s*(m|meters|metres|ft|feet)\b", re.IGNORECASE)
 STANDALONE_VALUE_PATTERN = re.compile(r"^[\d,]+\.?\d*\s*(m|meters|metres|ft|feet)$", re.IGNORECASE)
 
+# Quoted as an exact phrase - tested head-to-head against LangSearch: the
+# quoted-name query surfaced the actual ship-particulars PDF; unquoted-name
+# and IMO-number-only variants ("IMO 1234567 air draft", "1234567 air draft")
+# did not return it at all, just unrelated vessels.
 SEARCH_QUERIES = [
-    "{name} air draft",
-    "{name} air draught",
-    "{name} ship pdf",
+    '"{name}" air draft',
+    '"{name}" air draught',
+    '"{name}" ship pdf',
 ]
 
-MAX_RESULTS_PER_QUERY = 5
+MAX_RESULTS_PER_QUERY = 8
 MAX_PAGES_TO_FETCH = 12
 
+LANGSEARCH_URL = "https://api.langsearch.com/v1/web-search"
 
-def duckduckgo_search(query: str, max_results: int = MAX_RESULTS_PER_QUERY):
+
+def langsearch_search(query: str, max_results: int = MAX_RESULTS_PER_QUERY):
     resp = requests.post(
-        "https://html.duckduckgo.com/html/",
-        data={"q": query},
-        headers={"User-Agent": USER_AGENT},
+        LANGSEARCH_URL,
+        json={"query": query, "count": max_results, "freshness": "noLimit"},
+        headers={
+            "Authorization": f"Bearer {LANGSEARCH_API_KEY}",
+            "Content-Type": "application/json",
+        },
         timeout=20,
     )
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    data = resp.json()
+    if data.get("code") != 200:
+        raise RuntimeError(f"LangSearch API error: {data.get('code')} {data.get('msg')}")
 
-    results = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href")
-        title = a.get_text(strip=True)
-        if href:
-            results.append((title, href))
-        if len(results) >= max_results:
-            break
-    return results
+    values = ((data.get("data") or {}).get("webPages") or {}).get("value") or []
+    return [(v["name"], v["url"]) for v in values[:max_results]]
 
 
 def fetch_pdf_text(content: bytes) -> str:
@@ -300,7 +313,7 @@ def main():
         query = template.format(name=vessel_name)
         log(f"[search] {query}")
         try:
-            results = duckduckgo_search(query)
+            results = langsearch_search(query)
         except Exception as exc:
             log(f"  search failed: {exc}")
             continue
