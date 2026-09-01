@@ -23,6 +23,14 @@ BOUNDING_BOX = (
 AIR_DRAFT_THRESHOLD_FT = float(os.environ.get("AIR_DRAFT_THRESHOLD_FT", 70))
 SILENCE_WINDOW_MINUTES = float(os.environ.get("SILENCE_WINDOW_MINUTES", 30))
 UNKNOWN_RETRY_HOURS = float(os.environ.get("UNKNOWN_RETRY_HOURS", 1))
+# How long to wait before re-queuing a vessel whose last air draft lookup
+# failed outright (LookupError - the search or every page fetch errored, as
+# opposed to a completed lookup that found nothing). Without this, such a
+# vessel is re-queued on every 10-minute sweep and, if the failure is
+# persistent (e.g. every search result is an un-fetchable giant PDF), burns
+# a worker slot forever. Set well above the sweep interval so a transient
+# blip costs at most one wasted attempt.
+FAILED_LOOKUP_BACKOFF_MINUTES = float(os.environ.get("FAILED_LOOKUP_BACKOFF_MINUTES", 30))
 LOOKUP_CONCURRENCY = int(os.environ.get("LOOKUP_CONCURRENCY", 3))
 SEARCH_REQUEST_DELAY_SECONDS = float(os.environ.get("SEARCH_REQUEST_DELAY_SECONDS", 2.0))
 

@@ -58,11 +58,32 @@ The repo has two parts:
   that's gone quiet longer than that won't be retried until it's heard from
   again, so workers aren't spent re-resolving vessels nobody can currently
   see.
-- Within that sweep, `PENDING` vessels (a lookup failed outright - the search
-  or every page fetch errored) are retried on the very next sweep, with no
-  delay. `UNKNOWN` vessels (a lookup completed but found nothing conclusive)
-  are only retried once `last_checked_at` is older than
+- Within that sweep, `PENDING` vessels (never successfully checked - either
+  not looked at yet, or every attempt so far errored out) are retried on the
+  next sweep. `UNKNOWN` vessels (a lookup completed but found nothing
+  conclusive) are only retried once `last_checked_at` is older than
   `UNKNOWN_RETRY_HOURS`.
+- Either way, a vessel whose **last attempt failed outright** (a
+  `LookupError` - the search or every page fetch errored, as opposed to a
+  completed lookup that found nothing) is held back for
+  `FAILED_LOOKUP_BACKOFF_MINUTES` before the next try, rather than re-queued
+  on every 10-minute sweep. `last_checked_at` only advances on a *completed*
+  lookup; `last_attempted_at` advances on every attempt including failures,
+  and is what the backoff is measured from. When attempts have failed since
+  the last completed check, the dashboard's "Last checked" column keeps
+  showing the completed-check age (that's when the shown result is from) and
+  appends a muted "· recheck failing" - so a vessel stuck retrying doesn't
+  look like it hasn't been checked in days, without a second timestamp
+  competing with the first. The vessel detail page spells out both times.
+- An `OK`/`FLAGGED` result is otherwise final and never re-run - **except**
+  when it was accepted on the weak `name_proximity` signal (only the
+  vessel's name, not its IMO or the page's own `NAME:` field, tied the page
+  to the vessel) and an IMO later arrives for that vessel (via AIS static
+  data or `run_imo_backfill`). The stronger IMO cross-check can now be
+  applied, so the result is reset to `PENDING` and re-resolved. This is what
+  catches a same-named-vessel false positive (e.g. a bunker tanker "TRINITY"
+  that picked up the 25 m mast height of the replica carrack *Nao Trinidad*
+  from a blog, because the lookup ran before the tanker's IMO was known).
 - **Vessels with no name at all** (AIS hasn't yet delivered a static-data
   message for them - only position reports so far, shown on the dashboard as
   `MMSI <n>`) are handled separately: the same sweep also tries to resolve a
@@ -112,8 +133,9 @@ All other variables are optional (defaults live in `app/config.py`):
 | `AIR_DRAFT_THRESHOLD_FT` | `70` | Air draft above this (in feet) is flagged |
 | `SILENCE_WINDOW_MINUTES` | `30` | How long a vessel stays on the dashboard after its last position report |
 | `UNKNOWN_RETRY_HOURS` | `1` | How long before a vessel marked `UNKNOWN` is retried |
+| `FAILED_LOOKUP_BACKOFF_MINUTES` | `30` | How long to hold back a vessel whose last lookup errored out before retrying it |
 | `LOOKUP_CONCURRENCY` | `3` | Number of concurrent air-draft lookup workers |
-| `DDG_REQUEST_DELAY_SECONDS` | `2.0` | Delay between DuckDuckGo requests during a lookup |
+| `SEARCH_REQUEST_DELAY_SECONDS` | `2.0` | Delay between search-API / page-fetch requests within a single lookup |
 | `DB_PATH` | `./ais.db` | SQLite file location (Docker sets this to `/data/ais.db`) |
 
 ### Run locally

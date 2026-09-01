@@ -17,6 +17,7 @@
   .badge-FLAGGED { background: #3a1414; color: #f87171; }
   .badge-UNKNOWN { background: #3a2e0f; color: #fbbf24; }
   .name-guessed { color: #fbbf24; cursor: help; margin-left: 0.3rem; }
+  .muted { color: #9aa4b2; }
   a { color: #7db4ff; }
   .empty { color: #9aa4b2; padding: 2rem 0; text-align: center; }
 </style>
@@ -55,7 +56,8 @@
         <td>{{ v.last_position_at or "—" }}</td>
         <td><span class="badge badge-{{ v.status }}">{{ v.status }}</span></td>
         <td>{{ "%.2f m / %.1f ft"|format(v.value_m, v.value_ft) if v.value_m is not none else "—" }}</td>
-        <td>{{ v.last_checked_at or "never" }}</td>
+        <td>{{ v.last_checked_at or "never" }}{% if v.last_attempted_at and v.last_attempted_at > (v.last_checked_at or "") %}
+          <span class="muted" title="Last successful check: {{ v.last_checked_at or 'never' }}. A re-check was attempted at {{ v.last_attempted_at }} but errored out before finishing (search or every page fetch failed), so the result above is unchanged.">&middot; recheck failing</span>{% endif %}</td>
         <td>{% if v.source_url %}<a href="{{ v.source_url }}" target="_blank" rel="noopener">{{ v.source_title or "link" }}</a>{% else %}—{% endif %}</td>
       </tr>
       {% endfor %}
@@ -81,6 +83,17 @@ function fmtAirDraft(v) {
   return `${v.value_m.toFixed(2)} m / ${v.value_ft.toFixed(1)} ft`;
 }
 
+function fmtChecked(v) {
+  const checked = v.last_checked_at ? fmtAgo(v.last_checked_at) : "never";
+  if (v.last_attempted_at && (!v.last_checked_at || v.last_attempted_at > v.last_checked_at)) {
+    const tip = `Last successful check: ${v.last_checked_at || "never"}. `
+      + `A re-check was attempted at ${v.last_attempted_at} but errored out before finishing `
+      + `(search or every page fetch failed), so the result above is unchanged.`;
+    return `${checked} <span class="muted" title="${tip}">&middot; recheck failing</span>`;
+  }
+  return checked;
+}
+
 function render(vessels) {
   const body = document.getElementById("vessel-body");
   if (!vessels.length) {
@@ -96,7 +109,7 @@ function render(vessels) {
       <td>${fmtAgo(v.last_position_at)}</td>
       <td>${badge(v.status)}</td>
       <td>${fmtAirDraft(v)}</td>
-      <td>${fmtAgo(v.last_checked_at)}</td>
+      <td>${fmtChecked(v)}</td>
       <td>${v.source_url ? `<a href="${v.source_url}" target="_blank" rel="noopener">${v.source_title ?? "link"}</a>` : "—"}</td>
     </tr>
   `).join("");

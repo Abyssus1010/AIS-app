@@ -27,9 +27,11 @@ async def _resolve_and_save(mmsi: int, name: str | None) -> None:
         result = await asyncio.to_thread(resolve_air_draft, name, imo)
     except LookupError:
         logger.warning("Lookup failed for %r (mmsi=%s), will retry later", name, mmsi)
+        await asyncio.to_thread(db.record_failed_attempt, mmsi)
         return
     except Exception:
         logger.exception("Unexpected error resolving air draft for %r (mmsi=%s)", name, mmsi)
+        await asyncio.to_thread(db.record_failed_attempt, mmsi)
         return
 
     await asyncio.to_thread(
@@ -42,6 +44,7 @@ async def _resolve_and_save(mmsi: int, name: str | None) -> None:
         result.source_url,
         result.source_title,
         result.context,
+        result.identity,
     )
     logger.info("Resolved %r (mmsi=%s): %s", name, mmsi, result.status)
 
@@ -64,8 +67,10 @@ async def run_stale_unknown_requeue(queue: asyncio.Queue) -> None:
     resolve_vessel_name). All three are scoped to vessels still within
     SILENCE_WINDOW_MINUTES - a vessel that's gone quiet longer than that is no
     longer shown on the dashboard, so retrying it would just waste a lookup
-    worker on a vessel nobody can currently see. Runs once immediately, then
-    on a fixed interval."""
+    worker on a vessel nobody can currently see. A vessel whose last lookup
+    failed outright is also held back for FAILED_LOOKUP_BACKOFF_MINUTES
+    (see db.record_failed_attempt) rather than retried on every pass. Runs
+    once immediately, then on a fixed interval."""
     while True:
         for row in await asyncio.to_thread(
             db.get_vessels_needing_name_lookup, config.SILENCE_WINDOW_MINUTES
@@ -75,14 +80,19 @@ async def run_stale_unknown_requeue(queue: asyncio.Queue) -> None:
                 await queue.put((row["mmsi"], None))
 
         for row in await asyncio.to_thread(
-            db.get_vessels_needing_initial_lookup, config.SILENCE_WINDOW_MINUTES
+            db.get_vessels_needing_initial_lookup,
+            config.SILENCE_WINDOW_MINUTES,
+            config.FAILED_LOOKUP_BACKOFF_MINUTES,
         ):
             if row["mmsi"] not in IN_FLIGHT:
                 IN_FLIGHT.add(row["mmsi"])
                 await queue.put((row["mmsi"], row["name"]))
 
         for row in await asyncio.to_thread(
-            db.get_stale_unknown_vessels, config.UNKNOWN_RETRY_HOURS, config.SILENCE_WINDOW_MINUTES
+            db.get_stale_unknown_vessels,
+            config.UNKNOWN_RETRY_HOURS,
+            config.SILENCE_WINDOW_MINUTES,
+            config.FAILED_LOOKUP_BACKOFF_MINUTES,
         ):
             if row["mmsi"] not in IN_FLIGHT:
                 IN_FLIGHT.add(row["mmsi"])
@@ -99,9 +109,12 @@ async def run_imo_backfill() -> None:
     one, is simply never coming for them. Reuses resolve_vessel_name's
     confirmed MMSI-in-URL/title matching, which already recovers IMO
     alongside name - it's just never invoked once the name half is already
-    known. Runs independently of the main lookup queue: an IMO patch
-    shouldn't trigger, or wait behind, a re-resolve of an already-resolved
-    air draft status."""
+    known. Runs independently of the main lookup queue: patching in an IMO
+    shouldn't wait behind a re-resolve of an already-resolved air draft
+    status. It can still *cause* one - db.set_imo resets a weakly-identified
+    (name-proximity) OK/FLAGGED result to PENDING - but that re-resolve is
+    picked up by the normal stale sweep on its next pass, not run inline
+    here."""
     while True:
         for row in await asyncio.to_thread(
             db.get_vessels_needing_imo_lookup, config.SILENCE_WINDOW_MINUTES

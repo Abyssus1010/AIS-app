@@ -66,7 +66,14 @@
           <span style="color:#9aa4b2;">(flag threshold: {{ threshold_ft }} ft)</span></dd>
 
         <dt>Last checked</dt>
-        <dd>{{ vessel.last_checked_at or "never" }}</dd>
+        <dd>{{ vessel.last_checked_at or "never" }}
+          <span style="color:#9aa4b2;">(last lookup that completed and produced the result above)</span></dd>
+
+        {% if vessel.last_attempted_at and vessel.last_attempted_at > (vessel.last_checked_at or "") %}
+        <dt>Re-check</dt>
+        <dd>failing &mdash; last attempted {{ vessel.last_attempted_at }}
+          <span style="color:#9aa4b2;">(errored out before finishing: search or every page fetch failed; the result above is unchanged)</span></dd>
+        {% endif %}
 
         <dt>Source</dt>
         <dd>{% if vessel.source_url %}<a href="{{ vessel.source_url }}" target="_blank" rel="noopener">{{ vessel.source_title or "link" }}</a>{% else %}—{% endif %}</dd>

@@ -52,6 +52,7 @@ def _serialize(row) -> dict:
         "source_url": row["air_draft_source_url"],
         "source_title": row["air_draft_source_title"],
         "last_checked_at": row["last_checked_at"],
+        "last_attempted_at": row["last_attempted_at"],
     }
 
 

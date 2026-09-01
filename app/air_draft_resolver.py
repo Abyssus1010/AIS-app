@@ -123,6 +123,14 @@ class LookupResult:
     source_url: str | None
     source_title: str | None
     context: str | None
+    # How the fetched page was confirmed to be about the target vessel:
+    # "declared_name" (the page's own NAME: field) and "imo" (the target's
+    # IMO appears next to the match) are strong; "name_proximity" is weak -
+    # only the vessel's name appears nearby, which collides readily on
+    # short/common names (see find_matches). Persisted so a later-arriving
+    # IMO can force a re-resolve of anything accepted on the weak signal
+    # (see db.set_imo). None for an UNKNOWN with no source at all.
+    identity: Literal["declared_name", "imo", "name_proximity", "unconfirmed"] | None = None
 
 
 def langsearch_search(query: str, max_results: int = MAX_RESULTS_PER_QUERY):
@@ -144,12 +152,26 @@ def langsearch_search(query: str, max_results: int = MAX_RESULTS_PER_QUERY):
     return [(v["name"], v["url"]) for v in values[:max_results]]
 
 
+def _valid_imo(value) -> int | None:
+    """Coerce a parsed IMO to a real one or None. Vessel-tracker URLs and
+    titles routinely use `imo:0` / `-imo-0` / "IMO 0" as a placeholder for
+    "no IMO on file" (MyShipTracking and MarineTraffic both do this for
+    craft without one), and AIS itself transmits 0 the same way - storing
+    that 0 is worse than storing nothing: it blocks the IMO backfill (which
+    only looks at NULL rows) and can't serve as a cross-check. Anything
+    outside the 7-digit IMO range is treated as absent."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if 1_000_000 <= n <= 9_999_999 else None
+
+
 def _name_from_url(url: str, mmsi: int) -> tuple[str, int | None] | None:
     match = URL_SLUG_MMSI_PATTERN.search(url)
     if match and match.group(2) == str(mmsi):
         name = match.group(1).replace("-", " ").upper()
-        imo = int(match.group(3)) if match.group(3) else None
-        return name, imo
+        return name, _valid_imo(match.group(3))
 
     fields = {}
     for segment in url.split("/"):
@@ -159,8 +181,7 @@ def _name_from_url(url: str, mmsi: int) -> tuple[str, int | None] | None:
                 fields[key] = segment[len(prefix):]
     if fields.get("mmsi") == str(mmsi) and fields.get("vessel"):
         name = fields["vessel"].replace("_", " ").replace("-", " ").strip().upper()
-        imo = int(fields["imo"]) if fields.get("imo", "").isdigit() else None
-        return name, imo
+        return name, _valid_imo(fields.get("imo"))
     return None
 
 
@@ -175,7 +196,7 @@ def _name_from_title(title: str) -> tuple[str, int | None] | None:
     ):
         return None
     imo_match = TITLE_IMO_PATTERN.search(title)
-    return name, (int(imo_match.group(1)) if imo_match else None)
+    return name, (_valid_imo(imo_match.group(1)) if imo_match else None)
 
 
 def resolve_vessel_name(mmsi: int) -> tuple[str, int | None] | None:
@@ -400,21 +421,33 @@ def find_matches(text: str, vessel_name: str | None = None, imo: int | None = No
 
     if vessel_name:
         declared_name = _extract_declared_name(text)
-        if declared_name is not None:
-            if declared_name.upper() == _normalize_ws(vessel_name).upper():
-                name_re = None  # document's own declared name already confirms identity
-                doc_identity = "declared_name"
-            elif imo_re is None:
-                return []
-            # else: the document declares a different vessel, but there's an
-            # IMO to cross-check with - don't reject the whole document
-            # outright (declared-name extraction can misfire on a
-            # multi-vessel document, e.g. a fleet sheet listing several
-            # sister ships). Fall through to the same per-hit name-OR-IMO
-            # proximity check used when there's no declared-name field at
-            # all, so a hit is only accepted if OUR name or IMO is actually
-            # near it - not just present somewhere else in the document next
-            # to a different ship's fields.
+        if declared_name is not None and declared_name.upper() == _normalize_ws(vessel_name).upper():
+            name_re = None  # document's own declared name already confirms identity
+            doc_identity = "declared_name"
+        elif imo_re is not None and not imo_re.search(text):
+            # No declared-name field confirms this document as ours (either
+            # there isn't one, or it names a different vessel) - and we know
+            # this vessel's IMO, yet it doesn't appear anywhere in the
+            # document at all. A bare name-proximity match alone is too weak
+            # to trust in that situation: a short/common vessel name (e.g.
+            # "ESSENCE") readily collides with unrelated content that just
+            # happens to be about a same-named *something else* - a yacht
+            # brand's own product page, in one observed case, complete with
+            # its own genuine "Air draft" spec for an unrelated small boat.
+            # Real ship-particulars documents (what this tool actually
+            # targets) essentially always state the IMO alongside other
+            # specs, so this costs little real recall - it mainly screens
+            # out exactly this kind of coincidental name collision. (When
+            # the IMO is unknown, there's nothing to cross-check with, so
+            # this check is skipped entirely and name-proximity remains the
+            # only available signal, same as before.)
+            return []
+        # else: either the document declares a different vessel but our IMO
+        # does appear somewhere in it (e.g. a fleet sheet listing several
+        # sister ships, ours included further down), or IMO is unknown to us
+        # entirely - fall through to the per-hit name-OR-IMO proximity check
+        # below, so a hit is only accepted if OUR name or IMO is actually
+        # near it.
 
     hits = []
     for i, raw_line in enumerate(lines):
@@ -530,7 +563,9 @@ def resolve_air_draft(vessel_name: str, imo: int | None = None) -> LookupResult:
                 if parsed:
                     meters, feet = parsed
                     status = "FLAGGED" if feet > config.AIR_DRAFT_THRESHOLD_FT else "OK"
-                    result = LookupResult(status, hit["value"], meters, feet, url, title, hit["context"])
+                    result = LookupResult(
+                        status, hit["value"], meters, feet, url, title, hit["context"], hit["identity"]
+                    )
                     if hit["tier"] == "primary":
                         return result
                     if fallback_hit is None:
@@ -546,14 +581,14 @@ def resolve_air_draft(vessel_name: str, imo: int | None = None) -> LookupResult:
             # also just ordinary British English for a cold air current -
             # see e.g. draught-excluder/weatherstripping product listings).
             if keyword_only_hit is None and hit["identity"] in ("declared_name", "imo"):
-                keyword_only_hit = (url, title, hit["context"])
+                keyword_only_hit = (url, title, hit["context"], hit["identity"])
 
     if fallback_hit:
         return fallback_hit
 
     if keyword_only_hit:
-        url, title, context = keyword_only_hit
-        return LookupResult("UNKNOWN", None, None, None, url, title, context)
+        url, title, context, identity = keyword_only_hit
+        return LookupResult("UNKNOWN", None, None, None, url, title, context, identity)
 
     if not any_fetch_succeeded:
         raise LookupError(f"all page fetches failed for {vessel_name!r}")
