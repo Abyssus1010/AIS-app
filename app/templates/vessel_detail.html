@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>{{ vessel.name }} - AIS Air Draft Monitor</title>
+<title>{{ vessel.name }} - AIS Vessel Height Monitor</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <style>
@@ -31,6 +31,41 @@
   .swatch-marker { background: #f87171; }
   .swatch-bbox { border: 2px dashed #e930ff; box-sizing: border-box; }
   .no-position { padding: 1rem; color: #9aa4b2; font-size: 0.9rem; }
+
+  .height-section { margin-top: 1.5rem; background: #161b22; border: 1px solid #232833; border-radius: 8px; padding: 1.2rem 1.4rem; }
+  .height-section h2 { font-size: 1rem; margin: 0 0 0.3rem; }
+  .height-section .desc { color: #9aa4b2; font-size: 0.85rem; margin-bottom: 1.2rem; max-width: 60em; }
+
+  .pipeline { display: flex; align-items: stretch; gap: 0; flex-wrap: wrap; margin-bottom: 1.6rem; }
+  .pipeline .step { background: #0e1116; border: 1px solid #232833; border-radius: 6px; padding: 0.55rem 0.9rem; min-width: 110px; }
+  .pipeline .step-label { color: #9aa4b2; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .pipeline .step-value { font-size: 0.92rem; margin-top: 0.2rem; font-weight: 600; }
+  .pipeline .step-value .sub { color: #9aa4b2; font-weight: 400; font-size: 0.85em; }
+  .pipeline .arrow { display: flex; align-items: center; justify-content: center; color: #4a5568; padding: 0 0.4rem; font-size: 1.1rem; }
+
+  .scale-block { margin-bottom: 1.4rem; }
+  .scale-block .scale-label { color: #9aa4b2; font-size: 0.78rem; margin-bottom: 1.8rem; }
+  .scale-bar { position: relative; height: 28px; border-radius: 4px; overflow: visible; }
+  .scale-seg { position: absolute; top: 0; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 0.65rem; color: #7f8a9a; border-right: 1px solid #0e1116; box-sizing: border-box; background: #1c222c; }
+  .scale-seg:nth-child(even) { background: #20262f; }
+  .scale-seg:last-child { border-right: none; }
+  .scale-seg.active { background: #2b3a55; color: #bcd4ff; font-weight: 700; }
+  .scale-marker { position: absolute; top: -7px; width: 2px; height: 42px; background: #7db4ff; }
+  .scale-marker .marker-tag { position: absolute; top: -18px; left: 50%; transform: translateX(-50%); font-size: 0.68rem; color: #7db4ff; white-space: nowrap; }
+
+  .full-table-disclosure { margin-top: 1.6rem; border-top: 1px solid #232833; padding-top: 1rem; }
+  .full-table-disclosure summary { cursor: pointer; color: #7db4ff; font-size: 0.85rem; user-select: none; }
+  .full-table-disclosure summary:hover { text-decoration: underline; }
+  .full-table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: 0.82rem; table-layout: fixed; }
+  .full-table th, .full-table td { border: 1px solid #232833; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
+  .full-table th { color: #9aa4b2; font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  .full-table th:nth-child(1), .full-table td:nth-child(1) { width: 14%; }
+  .full-table th:nth-child(2), .full-table td:nth-child(2) { width: 13%; }
+  .full-table th:nth-child(3), .full-table td:nth-child(3) { width: 9%; }
+  .full-table tr.active td { background: #2b3a55; color: #bcd4ff; font-weight: 700; }
+  .full-table .cell-range { color: #7f8a9a; }
+  .full-table .cell-basis { color: #b7bfca; font-weight: 400; line-height: 1.4; white-space: normal; }
+  .full-table tr.active .cell-basis { color: #bcd4ff; font-weight: 400; }
 </style>
 </head>
 <body>
@@ -44,7 +79,7 @@
     <div class="info-panel">
       <dl>
         <dt>Status</dt>
-        <dd><span class="badge badge-{{ vessel.status }}">{{ vessel.status }}</span></dd>
+        <dd><span class="badge badge-{{ vessel.est_height_status }}">{{ vessel.est_height_status }}</span></dd>
 
         <dt>MMSI</dt>
         <dd>{{ vessel.mmsi }}</dd>
@@ -60,23 +95,6 @@
 
         <dt>Last seen</dt>
         <dd>{{ vessel.last_position_at or "—" }}</dd>
-
-        <dt>Air draft</dt>
-        <dd>{{ "%.2f m / %.1f ft"|format(vessel.value_m, vessel.value_ft) if vessel.value_m is not none else "—" }}
-          <span style="color:#9aa4b2;">(flag threshold: {{ threshold_ft }} ft)</span></dd>
-
-        <dt>Last checked</dt>
-        <dd>{{ vessel.last_checked_at or "never" }}
-          <span style="color:#9aa4b2;">(last lookup that completed and produced the result above)</span></dd>
-
-        {% if vessel.last_attempted_at and vessel.last_attempted_at > (vessel.last_checked_at or "") %}
-        <dt>Re-check</dt>
-        <dd>failing &mdash; last attempted {{ vessel.last_attempted_at }}
-          <span style="color:#9aa4b2;">(errored out before finishing: search or every page fetch failed; the result above is unchanged)</span></dd>
-        {% endif %}
-
-        <dt>Source</dt>
-        <dd>{% if vessel.source_url %}<a href="{{ vessel.source_url }}" target="_blank" rel="noopener">{{ vessel.source_title or "link" }}</a>{% else %}—{% endif %}</dd>
       </dl>
 
       <div class="legend">
@@ -84,6 +102,85 @@
         <span><i class="swatch swatch-bbox"></i>Monitoring zone</span>
       </div>
     </div>
+  </div>
+
+  <div class="height-section">
+    <h2>Type/size height estimate</h2>
+    <div class="desc">
+      AIS already broadcasts this vessel's type and length overall, so a generic height is read
+      straight off a preset type+size table - instant and free, but a rougher number than a real
+      measurement.
+    </div>
+
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-label">AIS type</div>
+        <div class="step-value">{{ height_explainer.ais_type if height_explainer.ais_type is not none else "—" }}</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">Category</div>
+        <div class="step-value">{{ height_explainer.category_label or "unknown" }}</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">Length overall</div>
+        <div class="step-value">{{ "%.0f m"|format(height_explainer.loa_m) if height_explainer.loa_m is not none else "—" }}</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">Size bracket</div>
+        <div class="step-value">{{ height_explainer.bracket or "—" }}{% if height_explainer.bracket_range_label %}<br><span class="sub">{{ height_explainer.bracket_range_label }}</span>{% endif %}</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">Table height</div>
+        <div class="step-value">{{ "%.0f ft"|format(height_explainer.height_ft) if height_explainer.height_ft is not none else "n/a" }}</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">vs. {{ threshold_ft }} ft</div>
+        <div class="step-value"><span class="badge badge-{{ height_explainer.status }}">{{ height_explainer.status }}</span></div>
+      </div>
+    </div>
+
+    {% if height_explainer.size_scale %}
+    <div class="scale-block">
+      <div class="scale-label">
+        Where this vessel's length overall ({{ "%.0f"|format(height_explainer.size_scale.loa_m) }} m) falls among
+        {{ height_explainer.category_label }} size brackets
+        {%- if height_explainer.size_scale.clamped %} &mdash; off the edge of this scale, shown at the boundary{% endif %}
+      </div>
+      <div class="scale-bar">
+        {% for seg in height_explainer.size_scale.segments %}
+        <div class="scale-seg{{ ' active' if seg.label == height_explainer.bracket else '' }}"
+             style="left:{{ seg.start_pct }}%;width:{{ (seg.end_pct - seg.start_pct)|round(2) }}%;">{{ seg.label }}</div>
+        {% endfor %}
+        <div class="scale-marker" style="left:{{ height_explainer.size_scale.marker_pct }}%;">
+          <span class="marker-tag">{{ "%.0f"|format(height_explainer.size_scale.loa_m) }} m</span>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <details class="full-table-disclosure">
+      <summary>View full type+size table</summary>
+      <table class="full-table">
+        <thead>
+          <tr><th>Category</th><th>Size range</th><th>Height</th><th>How this value was derived</th></tr>
+        </thead>
+        <tbody>
+          {% for row in full_table %}
+          <tr class="{{ 'active' if row.category == height_explainer.category and row.bracket == height_explainer.bracket }}">
+            <td>{{ row.category_label }}</td>
+            <td class="cell-range">{{ row.range_label }}</td>
+            <td>{{ row.height_ft|round|int }} ft</td>
+            <td class="cell-basis">{{ row.basis }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
   </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"

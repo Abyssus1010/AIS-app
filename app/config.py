@@ -20,18 +20,31 @@ BOUNDING_BOX = (
     else _DEFAULT_BOUNDING_BOX
 )
 
-AIR_DRAFT_THRESHOLD_FT = float(os.environ.get("AIR_DRAFT_THRESHOLD_FT", 70))
+# Compared against the type+size table's height estimate (see
+# vessel_height_table.py) - not a web-search-derived air draft anymore, but
+# kept as a single flag threshold the way AIR_DRAFT_THRESHOLD_FT was.
+HEIGHT_THRESHOLD_FT = float(os.environ.get("HEIGHT_THRESHOLD_FT", 70))
 SILENCE_WINDOW_MINUTES = float(os.environ.get("SILENCE_WINDOW_MINUTES", 30))
-UNKNOWN_RETRY_HOURS = float(os.environ.get("UNKNOWN_RETRY_HOURS", 1))
-# How long to wait before re-queuing a vessel whose last air draft lookup
-# failed outright (LookupError - the search or every page fetch errored, as
-# opposed to a completed lookup that found nothing). Without this, such a
-# vessel is re-queued on every 10-minute sweep and, if the failure is
-# persistent (e.g. every search result is an un-fetchable giant PDF), burns
-# a worker slot forever. Set well above the sweep interval so a transient
-# blip costs at most one wasted attempt.
-FAILED_LOOKUP_BACKOFF_MINUTES = float(os.environ.get("FAILED_LOOKUP_BACKOFF_MINUTES", 30))
 LOOKUP_CONCURRENCY = int(os.environ.get("LOOKUP_CONCURRENCY", 3))
+
+# Minimum spacing enforced between LangSearch API calls (see
+# vessel_name_lookup._throttle) - LangSearch's rate limit is tight enough
+# that LOOKUP_CONCURRENCY workers calling it independently trip 429s
+# routinely; this serializes every caller (the name-guess pool, the IMO/
+# category backfill loop) behind one shared minimum interval instead.
 SEARCH_REQUEST_DELAY_SECONDS = float(os.environ.get("SEARCH_REQUEST_DELAY_SECONDS", 2.0))
+
+# Same idea as SEARCH_REQUEST_DELAY_SECONDS but for the DuckDuckGo HTML
+# fallback (see vessel_name_lookup.duckduckgo_search) - kept as a separate
+# knob since it's a different, unauthenticated backend with its own
+# (undocumented) tolerance for request rate.
+DUCKDUCKGO_REQUEST_DELAY_SECONDS = float(os.environ.get("DUCKDUCKGO_REQUEST_DELAY_SECONDS", 2.0))
+
+# How long a vessel's row is kept after its last position report before the
+# purge sweep (worker.run_stale_purge) deletes it outright - independent of
+# SILENCE_WINDOW_MINUTES, which only hides a vessel from the dashboard/lookup
+# workers without ever removing its row. Comfortably larger than the silence
+# window so nothing gets purged while it could still reappear as "active".
+PURGE_AFTER_HOURS = float(os.environ.get("PURGE_AFTER_HOURS", 4))
 
 DB_PATH = os.environ.get("DB_PATH", "./ais.db")

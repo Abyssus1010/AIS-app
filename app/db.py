@@ -1,9 +1,25 @@
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from app import config
+from app import config, vessel_height_table
 
 _conn: sqlite3.Connection | None = None
+
+# Columns from the old web-search-based air draft lookup (dropped in favor
+# of the type+size table - see vessel_height_table.py). Migrated away via
+# DROP COLUMN below rather than left as dead weight in an existing DB.
+_RETIRED_AIR_DRAFT_COLUMNS = [
+    "air_draft_status",
+    "air_draft_value_raw",
+    "air_draft_value_m",
+    "air_draft_value_ft",
+    "air_draft_source_url",
+    "air_draft_source_title",
+    "air_draft_context",
+    "air_draft_identity",
+    "last_checked_at",
+    "last_attempted_at",
+]
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -26,18 +42,18 @@ def init_schema() -> None:
             last_lat                REAL,
             last_lon                REAL,
             last_position_at        TEXT,
-            air_draft_status        TEXT NOT NULL DEFAULT 'PENDING'
-                                     CHECK (air_draft_status IN ('PENDING','OK','FLAGGED','UNKNOWN')),
-            air_draft_value_raw     TEXT,
-            air_draft_value_m       REAL,
-            air_draft_value_ft      REAL,
-            air_draft_source_url    TEXT,
-            air_draft_source_title  TEXT,
-            air_draft_context       TEXT,
-            air_draft_identity      TEXT,
-            last_checked_at         TEXT,
-            last_attempted_at       TEXT,
             name_guessed            INTEGER NOT NULL DEFAULT 0,
+            category_guessed        INTEGER NOT NULL DEFAULT 0,
+            loa_guessed              INTEGER NOT NULL DEFAULT 0,
+            ais_type                INTEGER,
+            loa_m                   REAL,
+            est_height_status       TEXT NOT NULL DEFAULT 'UNKNOWN'
+                                     CHECK (est_height_status IN ('UNKNOWN','OK','FLAGGED')),
+            est_height_ft           REAL,
+            est_height_category     TEXT,
+            est_height_bracket      TEXT,
+            est_height_confidence   TEXT,
+            est_height_note         TEXT,
             created_at              TEXT NOT NULL,
             updated_at              TEXT NOT NULL
         )
@@ -46,16 +62,29 @@ def init_schema() -> None:
     _get_conn().execute(
         "CREATE INDEX IF NOT EXISTS idx_vessels_last_position ON vessels(last_position_at)"
     )
-    _get_conn().execute(
-        "CREATE INDEX IF NOT EXISTS idx_vessels_status_checked ON vessels(air_draft_status, last_checked_at)"
-    )
     existing_columns = {row["name"] for row in _get_conn().execute("PRAGMA table_info(vessels)")}
     if "name_guessed" not in existing_columns:
         _get_conn().execute("ALTER TABLE vessels ADD COLUMN name_guessed INTEGER NOT NULL DEFAULT 0")
-    if "air_draft_identity" not in existing_columns:
-        _get_conn().execute("ALTER TABLE vessels ADD COLUMN air_draft_identity TEXT")
-    if "last_attempted_at" not in existing_columns:
-        _get_conn().execute("ALTER TABLE vessels ADD COLUMN last_attempted_at TEXT")
+    if "category_guessed" not in existing_columns:
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN category_guessed INTEGER NOT NULL DEFAULT 0")
+    if "loa_guessed" not in existing_columns:
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN loa_guessed INTEGER NOT NULL DEFAULT 0")
+    if "ais_type" not in existing_columns:
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN ais_type INTEGER")
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN loa_m REAL")
+        _get_conn().execute(
+            "ALTER TABLE vessels ADD COLUMN est_height_status TEXT NOT NULL DEFAULT 'UNKNOWN'"
+        )
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_ft REAL")
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_category TEXT")
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_bracket TEXT")
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_confidence TEXT")
+        _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_note TEXT")
+    if any(column in existing_columns for column in _RETIRED_AIR_DRAFT_COLUMNS):
+        _get_conn().execute("DROP INDEX IF EXISTS idx_vessels_status_checked")
+    for column in _RETIRED_AIR_DRAFT_COLUMNS:
+        if column in existing_columns:
+            _get_conn().execute(f"ALTER TABLE vessels DROP COLUMN {column}")
     _get_conn().commit()
 
 
@@ -92,48 +121,13 @@ def upsert_position(mmsi: int, lat: float, lon: float) -> None:
     conn.commit()
 
 
-def _reresolve_if_weak_air_draft_identity(conn: sqlite3.Connection, mmsi: int, now: str) -> None:
-    """Reset an air draft result to PENDING when it was accepted on the weak
-    "name_proximity" signal (only the vessel's name appeared near the figure,
-    which collides readily on short/common names - e.g. a page about a
-    different vessel that merely mentions the word). Called when an IMO is
-    newly filled in for the vessel: the IMO is a stronger identity signal
-    than anything a name-proximity match had, so the lookup should re-run
-    with it available as a cross-check (see find_matches). UNKNOWN/PENDING
-    are already re-swept periodically, so only the confident OK/FLAGGED
-    verdicts need forcing back; a NULL identity (result predates this
-    column) is treated as weak and re-checked once."""
-    conn.execute(
-        """
-        UPDATE vessels SET
-            air_draft_status = 'PENDING',
-            air_draft_value_raw = NULL,
-            air_draft_value_m = NULL,
-            air_draft_value_ft = NULL,
-            air_draft_source_url = NULL,
-            air_draft_source_title = NULL,
-            air_draft_context = NULL,
-            air_draft_identity = NULL,
-            last_checked_at = NULL,
-            updated_at = ?
-        WHERE mmsi = ?
-          AND air_draft_status IN ('OK', 'FLAGGED')
-          AND (air_draft_identity IS NULL OR air_draft_identity NOT IN ('declared_name', 'imo'))
-        """,
-        (now, mmsi),
-    )
-
-
-def upsert_static_data(mmsi: int, imo: int | None, name: str | None) -> bool:
+def upsert_static_data(mmsi: int, imo: int | None, name: str | None) -> None:
     """Store name/IMO for a vessel, from AIS's own static-data broadcast -
     always treated as authoritative, clearing name_guessed even if a
-    heuristic MMSI-search name (see set_guessed_name) was set earlier.
-    Returns True if this is the first time a name became known for this
-    vessel (i.e. it should be enqueued for an air draft lookup)."""
+    heuristic MMSI-search name (see set_guessed_name) was set earlier."""
     now = _utcnow_iso()
     imo = _norm_imo(imo)
     conn = _get_conn()
-    prior = conn.execute("SELECT imo FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
     conn.execute(
         """
         INSERT INTO vessels (mmsi, imo, name, created_at, updated_at)
@@ -146,25 +140,12 @@ def upsert_static_data(mmsi: int, imo: int | None, name: str | None) -> bool:
         """,
         (mmsi, imo, name, now, now),
     )
-    if imo is not None and prior is not None and not prior["imo"]:
-        _reresolve_if_weak_air_draft_identity(conn, mmsi, now)
     conn.commit()
-
-    row = conn.execute(
-        "SELECT name, air_draft_status, last_checked_at FROM vessels WHERE mmsi = ?",
-        (mmsi,),
-    ).fetchone()
-    return bool(
-        row
-        and row["name"]
-        and row["air_draft_status"] == "PENDING"
-        and row["last_checked_at"] is None
-    )
 
 
 def set_guessed_name(mmsi: int, name: str, imo: int | None) -> None:
     """Stores a name resolved from the MMSI alone (see
-    air_draft_resolver.resolve_vessel_name), flagged via name_guessed so the
+    vessel_name_lookup.resolve_vessel_name), flagged via name_guessed so the
     UI can prompt a human to double-check it. Only applies if the vessel
     still has no name - if AIS's own static-data broadcast (upsert_static_data)
     already set one in the meantime, that's authoritative and this is a
@@ -191,74 +172,194 @@ def set_imo(mmsi: int, imo: int) -> None:
     for why this is needed - Class B craft never broadcast IMO at all, even
     once their name is known). Only applies if the vessel still has no IMO -
     if AIS's own static-data broadcast (upsert_static_data) already set one
-    in the meantime, that's authoritative and this is a no-op.
-
-    When the IMO is actually newly filled in, a weakly-identified air draft
-    result is reset for re-resolution - see
-    _reresolve_if_weak_air_draft_identity."""
+    in the meantime, that's authoritative and this is a no-op."""
     imo = _norm_imo(imo)
     if imo is None:
         return
     now = _utcnow_iso()
     conn = _get_conn()
-    cur = conn.execute(
+    conn.execute(
         "UPDATE vessels SET imo = ?, updated_at = ? WHERE mmsi = ? AND (imo IS NULL OR imo = 0)",
         (imo, now, mmsi),
     )
-    if cur.rowcount:
-        _reresolve_if_weak_air_draft_identity(conn, mmsi, now)
     conn.commit()
 
 
-def save_lookup_result(
-    mmsi: int,
-    status: str,
-    value_raw: str | None,
-    value_m: float | None,
-    value_ft: float | None,
-    source_url: str | None,
-    source_title: str | None,
-    context: str | None,
-    identity: str | None = None,
-) -> None:
+def save_type_dimension(mmsi: int, ais_type: int | None, loa_m: float | None) -> None:
+    """Stores AIS-reported ship type / length-overall and recomputes the
+    generic type+size height estimate (see vessel_height_table) from the
+    merged values. COALESCE keeps whichever of type/LOA was already known if
+    this particular message didn't carry one of them - in practice
+    ShipStaticData and StaticDataReport.ReportB always report Type and
+    Dimension together, so this only matters if an earlier message had one
+    and a later one has the other (e.g. a corrected/re-sent static report)."""
     now = _utcnow_iso()
     conn = _get_conn()
     conn.execute(
         """
+        INSERT INTO vessels (mmsi, ais_type, loa_m, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(mmsi) DO UPDATE SET
+            ais_type = COALESCE(excluded.ais_type, vessels.ais_type),
+            loa_m = COALESCE(excluded.loa_m, vessels.loa_m),
+            updated_at = excluded.updated_at
+        """,
+        (mmsi, ais_type, loa_m, now, now),
+    )
+    row = conn.execute("SELECT ais_type, loa_m FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
+    estimate = vessel_height_table.estimate_height_ft(row["ais_type"], row["loa_m"])
+    if estimate.height_ft is None:
+        status = "UNKNOWN"
+    else:
+        status = "FLAGGED" if estimate.height_ft > config.HEIGHT_THRESHOLD_FT else "OK"
+    conn.execute(
+        """
         UPDATE vessels SET
-            air_draft_status = ?,
-            air_draft_value_raw = ?,
-            air_draft_value_m = ?,
-            air_draft_value_ft = ?,
-            air_draft_source_url = ?,
-            air_draft_source_title = ?,
-            air_draft_context = ?,
-            air_draft_identity = ?,
-            last_checked_at = ?,
-            last_attempted_at = ?,
+            est_height_status = ?,
+            est_height_ft = ?,
+            est_height_category = ?,
+            est_height_bracket = ?,
+            est_height_confidence = ?,
+            est_height_note = ?,
+            category_guessed = CASE WHEN ? THEN 0 ELSE category_guessed END,
+            loa_guessed = CASE WHEN ? THEN 0 ELSE loa_guessed END,
             updated_at = ?
         WHERE mmsi = ?
         """,
-        (status, value_raw, value_m, value_ft, source_url, source_title, context, identity, now, now, now, mmsi),
+        (
+            status,
+            estimate.height_ft,
+            estimate.category.value,
+            estimate.bracket,
+            estimate.confidence,
+            estimate.note,
+            row["ais_type"] is not None,
+            loa_m is not None,
+            now,
+            mmsi,
+        ),
     )
     conn.commit()
 
 
-def record_failed_attempt(mmsi: int) -> None:
-    """Marks that an air draft lookup was attempted for this vessel but
-    could not be completed (the search or every page fetch errored - a
-    LookupError, not a completed lookup that found nothing). Bumps
-    last_attempted_at but deliberately leaves last_checked_at and the
-    air_draft_* result fields untouched: last_checked_at means "last
-    completed check", and a transient failure shouldn't wipe an earlier
-    good result. The stale-lookup sweep uses last_attempted_at to back off
-    from a vessel whose lookups keep failing instead of re-queuing it every
-    pass (see get_vessels_needing_initial_lookup / get_stale_unknown_vessels)."""
-    now = _utcnow_iso()
+def set_category_from_web(mmsi: int, category: str) -> None:
+    """Stores a height-estimate category resolved via a web search (see
+    vessel_name_lookup.resolve_vessel_name) for a vessel AIS has never
+    reported a type for. Only applies while ais_type is still NULL - if AIS's
+    own static-data broadcast arrives in the meantime, that's authoritative
+    and save_type_dimension already clears category_guessed and recomputes
+    from the real ais_type, the same way upsert_static_data's real name
+    overrides set_guessed_name's guess."""
     conn = _get_conn()
+    row = conn.execute("SELECT ais_type, loa_m FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
+    if row is None or row["ais_type"] is not None:
+        return
+    estimate = vessel_height_table.estimate_height_from_web_category(
+        vessel_height_table.Category(category), row["loa_m"]
+    )
+    if estimate.height_ft is None:
+        status = "UNKNOWN"
+    else:
+        status = "FLAGGED" if estimate.height_ft > config.HEIGHT_THRESHOLD_FT else "OK"
+    now = _utcnow_iso()
     conn.execute(
-        "UPDATE vessels SET last_attempted_at = ?, updated_at = ? WHERE mmsi = ?",
-        (now, now, mmsi),
+        """
+        UPDATE vessels SET
+            category_guessed = 1,
+            est_height_status = ?,
+            est_height_ft = ?,
+            est_height_category = ?,
+            est_height_bracket = ?,
+            est_height_confidence = ?,
+            est_height_note = ?,
+            updated_at = ?
+        WHERE mmsi = ? AND ais_type IS NULL
+        """,
+        (
+            status,
+            estimate.height_ft,
+            estimate.category.value,
+            estimate.bracket,
+            estimate.confidence,
+            estimate.note,
+            now,
+            mmsi,
+        ),
+    )
+    conn.commit()
+
+
+def set_loa_from_web(mmsi: int, loa_m: float) -> None:
+    """Stores a length overall resolved via a web search (see
+    vessel_name_lookup._length_m_from_text) for a vessel whose AIS Dimension
+    came back empty (Dimension.A/B are 0 - see
+    ais_client._loa_from_dimension). Only applies while loa_m is still NULL -
+    a real AIS Dimension arriving later is authoritative and
+    save_type_dimension's own COALESCE overwrites this unconditionally when
+    that happens (and clears loa_guessed, mirroring category_guessed).
+
+    If a category is already known (real ais_type, or an earlier web guess
+    via set_category_from_web), recomputes the height estimate immediately
+    using this LOA in place of the largest-bracket placeholder. If no
+    category is known at all yet, just stores the value - whichever of
+    save_type_dimension/set_category_from_web resolves the category next
+    will pick this LOA up on its own (both already SELECT loa_m fresh)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT ais_type, loa_m, est_height_category FROM vessels WHERE mmsi = ?", (mmsi,)
+    ).fetchone()
+    if row is None or row["loa_m"] is not None:
+        return
+    now = _utcnow_iso()
+
+    if row["ais_type"] is None and row["est_height_category"] is None:
+        conn.execute(
+            "UPDATE vessels SET loa_m = ?, loa_guessed = 1, updated_at = ? WHERE mmsi = ? AND loa_m IS NULL",
+            (loa_m, now, mmsi),
+        )
+        conn.commit()
+        return
+
+    if row["ais_type"] is not None:
+        estimate = vessel_height_table.estimate_height_ft(row["ais_type"], loa_m)
+        note = f"length overall sourced from a web search, not AIS ({estimate.note})"
+        confidence = "low"
+    else:
+        estimate = vessel_height_table.estimate_height_from_web_category(
+            vessel_height_table.Category(row["est_height_category"]), loa_m
+        )
+        note = estimate.note
+        confidence = estimate.confidence
+
+    if estimate.height_ft is None:
+        status = "UNKNOWN"
+    else:
+        status = "FLAGGED" if estimate.height_ft > config.HEIGHT_THRESHOLD_FT else "OK"
+    conn.execute(
+        """
+        UPDATE vessels SET
+            loa_m = ?,
+            loa_guessed = 1,
+            est_height_status = ?,
+            est_height_ft = ?,
+            est_height_category = ?,
+            est_height_bracket = ?,
+            est_height_confidence = ?,
+            est_height_note = ?,
+            updated_at = ?
+        WHERE mmsi = ? AND loa_m IS NULL
+        """,
+        (
+            loa_m,
+            status,
+            estimate.height_ft,
+            estimate.category.value,
+            estimate.bracket,
+            confidence,
+            note,
+            now,
+            mmsi,
+        ),
     )
     conn.commit()
 
@@ -275,7 +376,7 @@ def get_active_vessels(silence_window_minutes: float) -> list[sqlite3.Row]:
         """
         SELECT * FROM vessels
         WHERE last_position_at >= ?
-        ORDER BY (air_draft_status = 'FLAGGED') DESC, last_position_at DESC
+        ORDER BY (est_height_status = 'FLAGGED') DESC, last_position_at DESC
         """,
         (cutoff,),
     ).fetchall()
@@ -284,7 +385,9 @@ def get_active_vessels(silence_window_minutes: float) -> list[sqlite3.Row]:
 def get_vessels_needing_name_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
     """Vessels with a recent position but no name yet - AIS hasn't delivered
     a static-data message for them. Scoped to the same silence window as
-    dashboard visibility, same reasoning as get_vessels_needing_initial_lookup."""
+    dashboard visibility: a vessel that's gone quiet longer than that won't
+    be retried until it's heard from again, so workers aren't spent
+    re-resolving vessels nobody can currently see."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
     conn = _get_conn()
     return conn.execute(
@@ -296,27 +399,10 @@ def get_vessels_needing_name_lookup(silence_window_minutes: float) -> list[sqlit
     ).fetchall()
 
 
-def get_vessels_needing_initial_lookup(
-    silence_window_minutes: float, failed_backoff_minutes: float
-) -> list[sqlite3.Row]:
-    position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
-    attempt_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=failed_backoff_minutes)).isoformat()
-    conn = _get_conn()
-    return conn.execute(
-        """
-        SELECT mmsi, name FROM vessels
-        WHERE air_draft_status = 'PENDING' AND name IS NOT NULL AND last_checked_at IS NULL
-          AND last_position_at >= ?
-          AND (last_attempted_at IS NULL OR last_attempted_at <= ?)
-        """,
-        (position_cutoff, attempt_cutoff),
-    ).fetchall()
-
-
 def get_vessels_needing_imo_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
     """Vessels whose name is known but whose IMO never arrived - see
     worker.run_imo_backfill for why. Scoped to the same silence window as
-    dashboard visibility, same reasoning as get_vessels_needing_initial_lookup."""
+    dashboard visibility, same reasoning as get_vessels_needing_name_lookup."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
     conn = _get_conn()
     return conn.execute(
@@ -328,19 +414,62 @@ def get_vessels_needing_imo_lookup(silence_window_minutes: float) -> list[sqlite
     ).fetchall()
 
 
-def get_stale_unknown_vessels(
-    unknown_retry_hours: float, silence_window_minutes: float, failed_backoff_minutes: float
-) -> list[sqlite3.Row]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=unknown_retry_hours)).isoformat()
+def get_vessels_needing_category_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
+    """Vessels AIS has never reported a type for, whose name+IMO are already
+    both resolved - these are invisible to get_vessels_needing_imo_lookup
+    (its trigger, imo IS NULL, is already false for them), so without a
+    dedicated retry here they're stuck forever if the one search that
+    resolved their name/IMO happened to hit a result title
+    vessel_name_lookup._category_from_title couldn't parse (e.g. a
+    different tracker site's title shape) - in practice the majority case,
+    not a rare edge case."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
-    attempt_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=failed_backoff_minutes)).isoformat()
     conn = _get_conn()
     return conn.execute(
         """
-        SELECT mmsi, name FROM vessels
-        WHERE air_draft_status = 'UNKNOWN' AND last_checked_at <= ?
+        SELECT mmsi FROM vessels
+        WHERE ais_type IS NULL AND category_guessed = 0
+          AND name IS NOT NULL AND imo IS NOT NULL AND imo != 0
           AND last_position_at >= ?
-          AND (last_attempted_at IS NULL OR last_attempted_at <= ?)
         """,
-        (cutoff, position_cutoff, attempt_cutoff),
+        (position_cutoff,),
     ).fetchall()
+
+
+def get_vessels_needing_loa_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
+    """Vessels where AIS's own Dimension came back empty (ais_type IS NOT
+    NULL confirms a real static-data message arrived, but loa_m is still
+    NULL) and name/IMO are already both resolved too, so none of the other
+    backfill loops would ever search for this vessel again. Vessels still
+    missing name, IMO, or category get an LOA extraction attempt for free as
+    a byproduct of those loops' own searches (see worker._guess_and_save /
+    run_imo_backfill / run_category_backfill) - this covers only the
+    otherwise-fully-resolved residual case."""
+    position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    conn = _get_conn()
+    return conn.execute(
+        """
+        SELECT mmsi FROM vessels
+        WHERE ais_type IS NOT NULL AND loa_m IS NULL
+          AND name IS NOT NULL AND imo IS NOT NULL AND imo != 0
+          AND last_position_at >= ?
+        """,
+        (position_cutoff,),
+    ).fetchall()
+
+
+def purge_stale_vessels(retention_hours: float) -> int:
+    """Deletes vessels that have been silent longer than retention_hours -
+    see worker.run_stale_purge. Distinct from SILENCE_WINDOW_MINUTES, which
+    only hides a vessel from the dashboard/lookup workers without ever
+    freeing its row; nothing else deletes from this table. Falls back to
+    created_at for the handful of rows that somehow never got a position at
+    all (last_position_at IS NULL), so those can't survive forever either."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=retention_hours)).isoformat()
+    conn = _get_conn()
+    cur = conn.execute(
+        "DELETE FROM vessels WHERE COALESCE(last_position_at, created_at) < ?",
+        (cutoff,),
+    )
+    conn.commit()
+    return cur.rowcount

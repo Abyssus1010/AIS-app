@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>AIS Air Draft Monitor</title>
+<title>AIS Vessel Height Monitor</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 2rem; background: #0e1116; color: #e6e6e6; }
   h1 { font-size: 1.3rem; margin-bottom: 0.2rem; }
@@ -17,15 +17,16 @@
   .badge-FLAGGED { background: #3a1414; color: #f87171; }
   .badge-UNKNOWN { background: #3a2e0f; color: #fbbf24; }
   .name-guessed { color: #fbbf24; cursor: help; margin-left: 0.3rem; }
+  .low-confidence { color: #fbbf24; cursor: help; margin-left: 0.3rem; font-size: 0.85em; }
   .muted { color: #9aa4b2; }
   a { color: #7db4ff; }
   .empty { color: #9aa4b2; padding: 2rem 0; text-align: center; }
 </style>
 </head>
 <body>
-  <h1>AIS Air Draft Monitor</h1>
+  <h1>AIS Vessel Height Monitor</h1>
   <div class="subtitle">
-    Flagging vessels with air draft &gt; {{ threshold_ft }} ft &middot;
+    Flagging vessels with an estimated height &gt; {{ threshold_ft }} ft (from AIS type + length) &middot;
     showing vessels seen in the last {{ silence_window_minutes|int }} min
   </div>
 
@@ -38,14 +39,12 @@
         <th>Position</th>
         <th>Last seen</th>
         <th>Status</th>
-        <th>Air draft</th>
-        <th>Last checked</th>
-        <th>Source</th>
+        <th>Est. height</th>
       </tr>
     </thead>
     <tbody id="vessel-body">
       {% if not vessels %}
-      <tr><td colspan="9" class="empty">No vessels currently in range</td></tr>
+      <tr><td colspan="7" class="empty">No vessels currently in range</td></tr>
       {% endif %}
       {% for v in vessels %}
       <tr>
@@ -54,11 +53,8 @@
         <td>{{ v.imo or "—" }}</td>
         <td>{{ "%.4f, %.4f"|format(v.lat, v.lon) if v.lat is not none else "—" }}</td>
         <td>{{ v.last_position_at or "—" }}</td>
-        <td><span class="badge badge-{{ v.status }}">{{ v.status }}</span></td>
-        <td>{{ "%.2f m / %.1f ft"|format(v.value_m, v.value_ft) if v.value_m is not none else "—" }}</td>
-        <td>{{ v.last_checked_at or "never" }}{% if v.last_attempted_at and v.last_attempted_at > (v.last_checked_at or "") %}
-          <span class="muted" title="Last successful check: {{ v.last_checked_at or 'never' }}. A re-check was attempted at {{ v.last_attempted_at }} but errored out before finishing (search or every page fetch failed), so the result above is unchanged.">&middot; recheck failing</span>{% endif %}</td>
-        <td>{% if v.source_url %}<a href="{{ v.source_url }}" target="_blank" rel="noopener">{{ v.source_title or "link" }}</a>{% else %}—{% endif %}</td>
+        <td><span class="badge badge-{{ v.est_height_status }}">{{ v.est_height_status }}</span>{% if v.est_height_confidence == "low" %}<span class="low-confidence" title="{{ v.est_height_note }}">&#9888;</span>{% endif %}</td>
+        <td>{% if v.est_height_ft is not none %}<a href="/vessel/{{ v.mmsi }}">{{ "%.0f ft"|format(v.est_height_ft) }}</a>{% else %}—{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -78,26 +74,19 @@ function fmtAgo(iso) {
   return `${Math.round(diffMin / 60)} hr ago`;
 }
 
-function fmtAirDraft(v) {
-  if (v.value_m == null) return "—";
-  return `${v.value_m.toFixed(2)} m / ${v.value_ft.toFixed(1)} ft`;
+function escAttr(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function fmtChecked(v) {
-  const checked = v.last_checked_at ? fmtAgo(v.last_checked_at) : "never";
-  if (v.last_attempted_at && (!v.last_checked_at || v.last_attempted_at > v.last_checked_at)) {
-    const tip = `Last successful check: ${v.last_checked_at || "never"}. `
-      + `A re-check was attempted at ${v.last_attempted_at} but errored out before finishing `
-      + `(search or every page fetch failed), so the result above is unchanged.`;
-    return `${checked} <span class="muted" title="${tip}">&middot; recheck failing</span>`;
-  }
-  return checked;
+function fmtEstHeight(v) {
+  if (v.est_height_ft == null) return "—";
+  return `<a href="/vessel/${v.mmsi}">${v.est_height_ft.toFixed(0)} ft</a>`;
 }
 
 function render(vessels) {
   const body = document.getElementById("vessel-body");
   if (!vessels.length) {
-    body.innerHTML = `<tr><td colspan="9" class="empty">No vessels currently in range</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7" class="empty">No vessels currently in range</td></tr>`;
     return;
   }
   body.innerHTML = vessels.map(v => `
@@ -107,10 +96,8 @@ function render(vessels) {
       <td>${v.imo ?? "—"}</td>
       <td>${v.lat != null ? v.lat.toFixed(4) + ", " + v.lon.toFixed(4) : "—"}</td>
       <td>${fmtAgo(v.last_position_at)}</td>
-      <td>${badge(v.status)}</td>
-      <td>${fmtAirDraft(v)}</td>
-      <td>${fmtChecked(v)}</td>
-      <td>${v.source_url ? `<a href="${v.source_url}" target="_blank" rel="noopener">${v.source_title ?? "link"}</a>` : "—"}</td>
+      <td>${badge(v.est_height_status)}${v.est_height_confidence === "low" ? `<span class="low-confidence" title="${escAttr(v.est_height_note)}">&#9888;</span>` : ""}</td>
+      <td>${fmtEstHeight(v)}</td>
     </tr>
   `).join("");
 }
