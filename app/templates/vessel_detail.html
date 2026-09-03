@@ -66,6 +66,10 @@
   .full-table .cell-range { color: #7f8a9a; }
   .full-table .cell-basis { color: #b7bfca; font-weight: 400; line-height: 1.4; white-space: normal; }
   .full-table tr.active .cell-basis { color: #bcd4ff; font-weight: 400; }
+
+  .low-confidence-note { color: #fbbf24; }
+  .context-quote { margin-top: 0.9rem; padding: 0.6rem 0.9rem; background: #0e1116; border: 1px solid #232833;
+                    border-radius: 6px; font-size: 0.82rem; color: #9aa4b2; font-style: italic; }
 </style>
 </head>
 <body>
@@ -79,7 +83,8 @@
     <div class="info-panel">
       <dl>
         <dt>Status</dt>
-        <dd><span class="badge badge-{{ vessel.est_height_status }}">{{ vessel.est_height_status }}</span></dd>
+        <dd><span class="badge badge-{{ vessel.status }}">{{ vessel.status }}</span>
+          <span style="color:#9aa4b2; font-size:0.8rem;">({{ "confirmed via web search" if vessel.height_source == "air_draft_search" else "estimated from type+size table" }})</span></dd>
 
         <dt>MMSI</dt>
         <dd>{{ vessel.mmsi }}</dd>
@@ -105,11 +110,77 @@
   </div>
 
   <div class="height-section">
+    <h2>Air draft (web search)</h2>
+    <div class="desc">
+      Searches the web for this vessel's own published air draft before falling back to the
+      type+size table below - a real per-vessel figure when one can be found and confirmed,
+      instead of a generic estimate.
+    </div>
+
+    {% if air_draft.status == "PENDING" %}
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-label">Status</div>
+        <div class="step-value"><span class="badge badge-PENDING">PENDING</span></div>
+      </div>
+    </div>
+    <div class="desc">Search not yet attempted for this vessel.</div>
+
+    {% elif air_draft.status == "UNKNOWN" %}
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-label">Status</div>
+        <div class="step-value"><span class="badge badge-UNKNOWN">UNKNOWN</span></div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">Last checked</div>
+        <div class="step-value">{{ air_draft.checked_at or "—" }}</div>
+      </div>
+    </div>
+    <div class="desc">
+      No confirmed air draft found via web search{% if air_draft.source_url %} (closest lead:
+      <a href="{{ air_draft.source_url }}" target="_blank" rel="noopener">{{ air_draft.source_title or air_draft.source_url }}</a>){% endif %}.
+      Falling back to the type+size table estimate below.
+    </div>
+
+    {% else %}
+    <div class="pipeline">
+      <div class="step">
+        <div class="step-label">Confirmed value</div>
+        <div class="step-value">{{ air_draft.value_raw }}<br><span class="sub">{{ "%.1f m"|format(air_draft.value_m) }} / {{ "%.0f ft"|format(air_draft.value_ft) }}</span></div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">Identity match</div>
+        <div class="step-value">{{ air_draft.identity or "—" }}</div>
+      </div>
+      <div class="arrow">&rarr;</div>
+      <div class="step">
+        <div class="step-label">vs. {{ threshold_ft }} ft</div>
+        <div class="step-value"><span class="badge badge-{{ air_draft.status }}">{{ air_draft.status }}</span></div>
+      </div>
+    </div>
+    <div class="desc">
+      Source: <a href="{{ air_draft.source_url }}" target="_blank" rel="noopener">{{ air_draft.source_title or air_draft.source_url }}</a>
+      &middot; checked {{ air_draft.checked_at or "—" }}
+      {% if air_draft.effective.confidence == "low" %}<br><span class="low-confidence-note">&#9888; {{ air_draft.effective.note }}</span>{% endif %}
+    </div>
+    {% if air_draft.context %}<div class="context-quote">&ldquo;{{ air_draft.context }}&rdquo;</div>{% endif %}
+    {% endif %}
+  </div>
+
+  <div class="height-section">
     <h2>Type/size height estimate</h2>
     <div class="desc">
       AIS already broadcasts this vessel's type and length overall, so a generic height is read
       straight off a preset type+size table - instant and free, but a rougher number than a real
       measurement.
+      {% if air_draft.effective.source == "air_draft_search" %}
+      Not currently this vessel's verdict - superseded by the confirmed web-search air draft above.
+      {% else %}
+      This is currently this vessel's verdict, since no confirmed web-search air draft was found.
+      {% endif %}
     </div>
 
     <div class="pipeline">

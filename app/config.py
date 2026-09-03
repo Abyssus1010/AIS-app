@@ -20,12 +20,43 @@ BOUNDING_BOX = (
     else _DEFAULT_BOUNDING_BOX
 )
 
-# Compared against the type+size table's height estimate (see
-# vessel_height_table.py) - not a web-search-derived air draft anymore, but
-# kept as a single flag threshold the way AIR_DRAFT_THRESHOLD_FT was.
-HEIGHT_THRESHOLD_FT = float(os.environ.get("HEIGHT_THRESHOLD_FT", 70))
+# Single flag threshold, compared against whichever height figure is
+# authoritative for a vessel - a confirmed web-search air draft (see
+# air_draft_resolver.py) when one was found, else the type+size table's
+# estimate (see vessel_height_table.py) as a fallback. One shared threshold
+# for both rather than reviving a separate AIR_DRAFT_THRESHOLD_FT, since a
+# vessel can only have one live verdict at a time regardless of which method
+# produced it.
+#
+# This is only the SEED value, used once to populate the DB-backed setting
+# (db.init_schema) the first time the app ever runs against a given DB. The
+# live value users actually change from the dashboard lives in the
+# `settings` table from then on (db.get_height_threshold_ft /
+# set_height_threshold_ft) and survives restarts/redeploys, unlike this
+# module-level constant, which is fixed at process start from the
+# environment. Every call site that needs the *current* threshold - not just
+# the fallback seed - calls db.get_height_threshold_ft() instead of reading
+# this constant directly.
+DEFAULT_HEIGHT_THRESHOLD_FT = float(os.environ.get("HEIGHT_THRESHOLD_FT", 70))
 SILENCE_WINDOW_MINUTES = float(os.environ.get("SILENCE_WINDOW_MINUTES", 30))
 LOOKUP_CONCURRENCY = int(os.environ.get("LOOKUP_CONCURRENCY", 3))
+
+# Master switch for the web-search air draft lookup (see
+# air_draft_resolver.py / worker.run_air_draft_lookup) - it is far more
+# expensive per vessel than the name/IMO/category lookups (up to 3 search
+# queries, each fanning out to MAX_PAGES_TO_FETCH page/PDF fetches, some
+# requiring OCR), so this exists to be able to turn it off without a code
+# change if it ends up costing more LangSearch quota than expected.
+AIR_DRAFT_LOOKUP_ENABLED = os.environ.get("AIR_DRAFT_LOOKUP_ENABLED", "true").lower() not in ("false", "0", "")
+
+# How long to wait before retrying a vessel whose air draft search completed
+# but found nothing confirmed (status UNKNOWN) - deliberately much longer
+# than STALE_SWEEP_INTERVAL_SECONDS (worker.py's normal 10-minute sweep, used
+# for cheap lookups and for vessels never yet attempted): an UNKNOWN result
+# already cost a full multi-query, multi-page search, and a vessel with no
+# public particulars sheet indexed anywhere is unlikely to have one indexed
+# 10 minutes later - retrying that often would burn quota for no benefit.
+AIR_DRAFT_RETRY_HOURS = float(os.environ.get("AIR_DRAFT_RETRY_HOURS", 12))
 
 # Minimum spacing enforced between LangSearch API calls (see
 # vessel_name_lookup._throttle) - LangSearch's rate limit is tight enough

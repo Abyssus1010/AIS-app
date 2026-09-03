@@ -5,20 +5,26 @@ from app import config, vessel_height_table
 
 _conn: sqlite3.Connection | None = None
 
-# Columns from the old web-search-based air draft lookup (dropped in favor
-# of the type+size table - see vessel_height_table.py). Migrated away via
-# DROP COLUMN below rather than left as dead weight in an existing DB.
-_RETIRED_AIR_DRAFT_COLUMNS = [
-    "air_draft_status",
-    "air_draft_value_raw",
-    "air_draft_value_m",
-    "air_draft_value_ft",
-    "air_draft_source_url",
-    "air_draft_source_title",
-    "air_draft_context",
-    "air_draft_identity",
-    "last_checked_at",
-    "last_attempted_at",
+# Columns for the web-search-based air draft lookup (see
+# air_draft_resolver.py / worker.run_air_draft_lookup) - reinstated after a
+# stretch where the app relied on the type+size table alone (see
+# vessel_height_table.py). Kept as a separate set of columns from the
+# est_height_* ones rather than merged into them: est_height_* is always the
+# instant, no-network type+size table estimate, air_draft_* is the (slower,
+# not-always-available) confirmed web result - main._effective_height picks
+# whichever is authoritative for display rather than either table having to
+# know about the other.
+_AIR_DRAFT_COLUMNS_DDL = [
+    ("air_draft_status", "TEXT NOT NULL DEFAULT 'PENDING' CHECK (air_draft_status IN "
+                          "('PENDING','OK','FLAGGED','UNKNOWN'))"),
+    ("air_draft_value_raw", "TEXT"),
+    ("air_draft_value_m", "REAL"),
+    ("air_draft_value_ft", "REAL"),
+    ("air_draft_source_url", "TEXT"),
+    ("air_draft_source_title", "TEXT"),
+    ("air_draft_context", "TEXT"),
+    ("air_draft_identity", "TEXT"),
+    ("air_draft_checked_at", "TEXT"),
 ]
 
 
@@ -54,6 +60,16 @@ def init_schema() -> None:
             est_height_bracket      TEXT,
             est_height_confidence   TEXT,
             est_height_note         TEXT,
+            air_draft_status        TEXT NOT NULL DEFAULT 'PENDING'
+                                     CHECK (air_draft_status IN ('PENDING','OK','FLAGGED','UNKNOWN')),
+            air_draft_value_raw     TEXT,
+            air_draft_value_m       REAL,
+            air_draft_value_ft      REAL,
+            air_draft_source_url    TEXT,
+            air_draft_source_title  TEXT,
+            air_draft_context       TEXT,
+            air_draft_identity      TEXT,
+            air_draft_checked_at    TEXT,
             created_at              TEXT NOT NULL,
             updated_at              TEXT NOT NULL
         )
@@ -80,12 +96,68 @@ def init_schema() -> None:
         _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_bracket TEXT")
         _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_confidence TEXT")
         _get_conn().execute("ALTER TABLE vessels ADD COLUMN est_height_note TEXT")
-    if any(column in existing_columns for column in _RETIRED_AIR_DRAFT_COLUMNS):
-        _get_conn().execute("DROP INDEX IF EXISTS idx_vessels_status_checked")
-    for column in _RETIRED_AIR_DRAFT_COLUMNS:
-        if column in existing_columns:
-            _get_conn().execute(f"ALTER TABLE vessels DROP COLUMN {column}")
+    if "air_draft_status" not in existing_columns:
+        for column, ddl in _AIR_DRAFT_COLUMNS_DDL:
+            _get_conn().execute(f"ALTER TABLE vessels ADD COLUMN {column} {ddl}")
+
+    # Small key/value store for settings a user can change at runtime from
+    # the dashboard (currently just the height flag threshold - see
+    # get_height_threshold_ft/set_height_threshold_ft) rather than only via
+    # an env var at container start. Seeded from config.DEFAULT_HEIGHT_THRESHOLD_FT
+    # on first run against a given DB; a value already present (a prior
+    # user-set threshold, surviving a restart/redeploy) is left untouched.
+    _get_conn().execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    _get_conn().execute(
+        "INSERT INTO settings (key, value) VALUES ('height_threshold_ft', ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (str(config.DEFAULT_HEIGHT_THRESHOLD_FT),),
+    )
     _get_conn().commit()
+
+
+def get_height_threshold_ft() -> float:
+    """The live height flag threshold - what every OK/FLAGGED comparison in
+    this file (and air_draft_resolver.resolve_air_draft) actually compares
+    against, not config.DEFAULT_HEIGHT_THRESHOLD_FT directly, so a value set
+    via set_height_threshold_ft takes effect immediately without a restart."""
+    row = _get_conn().execute("SELECT value FROM settings WHERE key = 'height_threshold_ft'").fetchone()
+    return float(row["value"]) if row is not None else config.DEFAULT_HEIGHT_THRESHOLD_FT
+
+
+def set_height_threshold_ft(value: float) -> None:
+    """Changes the live height flag threshold (see get_height_threshold_ft)
+    and immediately re-derives every vessel's OK/FLAGGED status against the
+    new value - without this, a vessel whose height was computed under the
+    old threshold would keep showing its old verdict until something else
+    happened to recompute it (a new AIS message, a fresh air-draft search),
+    which could be hours away or never. Only rows that already have a real
+    height value are touched: a NULL est_height_ft stays UNKNOWN (nothing to
+    threshold), and air_draft_status is only rewritten for rows already OK/
+    FLAGGED (PENDING/UNKNOWN have no confirmed value to re-threshold either)."""
+    conn = _get_conn()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('height_threshold_ft', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(value),),
+    )
+    conn.execute(
+        """
+        UPDATE vessels SET est_height_status = CASE
+            WHEN est_height_ft IS NULL THEN 'UNKNOWN'
+            WHEN est_height_ft > ? THEN 'FLAGGED'
+            ELSE 'OK'
+        END
+        """,
+        (value,),
+    )
+    conn.execute(
+        """
+        UPDATE vessels SET air_draft_status = CASE WHEN air_draft_value_ft > ? THEN 'FLAGGED' ELSE 'OK' END
+        WHERE air_draft_status IN ('OK', 'FLAGGED')
+        """,
+        (value,),
+    )
+    conn.commit()
 
 
 def _utcnow_iso() -> str:
@@ -211,7 +283,7 @@ def save_type_dimension(mmsi: int, ais_type: int | None, loa_m: float | None) ->
     if estimate.height_ft is None:
         status = "UNKNOWN"
     else:
-        status = "FLAGGED" if estimate.height_ft > config.HEIGHT_THRESHOLD_FT else "OK"
+        status = "FLAGGED" if estimate.height_ft > get_height_threshold_ft() else "OK"
     conn.execute(
         """
         UPDATE vessels SET
@@ -260,7 +332,7 @@ def set_category_from_web(mmsi: int, category: str) -> None:
     if estimate.height_ft is None:
         status = "UNKNOWN"
     else:
-        status = "FLAGGED" if estimate.height_ft > config.HEIGHT_THRESHOLD_FT else "OK"
+        status = "FLAGGED" if estimate.height_ft > get_height_threshold_ft() else "OK"
     now = _utcnow_iso()
     conn.execute(
         """
@@ -334,7 +406,7 @@ def set_loa_from_web(mmsi: int, loa_m: float) -> None:
     if estimate.height_ft is None:
         status = "UNKNOWN"
     else:
-        status = "FLAGGED" if estimate.height_ft > config.HEIGHT_THRESHOLD_FT else "OK"
+        status = "FLAGGED" if estimate.height_ft > get_height_threshold_ft() else "OK"
     conn.execute(
         """
         UPDATE vessels SET
@@ -364,6 +436,80 @@ def set_loa_from_web(mmsi: int, loa_m: float) -> None:
     conn.commit()
 
 
+def set_air_draft_result(mmsi: int, result) -> None:
+    """Stores the outcome of a web-search air draft lookup (see
+    air_draft_resolver.resolve_air_draft / worker.run_air_draft_lookup).
+    `result` is an air_draft_resolver.LookupResult - kept as a loosely-typed
+    param (not importing that module here) to avoid a db<->air_draft_resolver
+    import cycle, since air_draft_resolver has no reason to import db itself.
+
+    Guarded to only apply while air_draft_status is still PENDING or UNKNOWN:
+    once a search has actually confirmed a value (OK/FLAGGED), that's treated
+    as final and never overwritten by a later search - mirrors set_imo/
+    set_guessed_name's "only if not already resolved" guard elsewhere in this
+    file. In normal operation this guard is redundant (db.
+    get_vessels_needing_air_draft_lookup already excludes OK/FLAGGED rows
+    from ever being queued again), but it's cheap insurance against a race
+    if that query and this write ever drift out of sync."""
+    now = _utcnow_iso()
+    conn = _get_conn()
+    conn.execute(
+        """
+        UPDATE vessels SET
+            air_draft_status = ?,
+            air_draft_value_raw = ?,
+            air_draft_value_m = ?,
+            air_draft_value_ft = ?,
+            air_draft_source_url = ?,
+            air_draft_source_title = ?,
+            air_draft_context = ?,
+            air_draft_identity = ?,
+            air_draft_checked_at = ?,
+            updated_at = ?
+        WHERE mmsi = ? AND air_draft_status IN ('PENDING', 'UNKNOWN')
+        """,
+        (
+            result.status,
+            result.value_raw,
+            result.value_m,
+            result.value_ft,
+            result.source_url,
+            result.source_title,
+            result.context,
+            result.identity,
+            now,
+            now,
+            mmsi,
+        ),
+    )
+    conn.commit()
+
+
+def get_vessels_needing_air_draft_lookup(
+    silence_window_minutes: float, retry_after_hours: float
+) -> list[sqlite3.Row]:
+    """Vessels due for a web-search air draft lookup: named (the search needs
+    something to query for), and either never yet attempted (PENDING) or
+    attempted but unresolved (UNKNOWN) longer than retry_after_hours ago -
+    see config.AIR_DRAFT_RETRY_HOURS for why UNKNOWN gets a much longer
+    backoff than the other lookups' fixed sweep interval. A confirmed result
+    (OK/FLAGGED) never reappears here - see set_air_draft_result."""
+    position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    retry_cutoff = (datetime.now(timezone.utc) - timedelta(hours=retry_after_hours)).isoformat()
+    conn = _get_conn()
+    return conn.execute(
+        """
+        SELECT mmsi, name, imo FROM vessels
+        WHERE name IS NOT NULL AND last_position_at >= ?
+          AND (
+            air_draft_status = 'PENDING'
+            OR (air_draft_status = 'UNKNOWN' AND (air_draft_checked_at IS NULL OR air_draft_checked_at < ?))
+          )
+        """,
+        (position_cutoff, retry_cutoff),
+    ).fetchall()
+
+
 def get_vessel(mmsi: int) -> sqlite3.Row | None:
     conn = _get_conn()
     return conn.execute("SELECT * FROM vessels WHERE mmsi = ?", (mmsi,)).fetchone()
@@ -376,7 +522,10 @@ def get_active_vessels(silence_window_minutes: float) -> list[sqlite3.Row]:
         """
         SELECT * FROM vessels
         WHERE last_position_at >= ?
-        ORDER BY (est_height_status = 'FLAGGED') DESC, last_position_at DESC
+        ORDER BY (
+            CASE WHEN air_draft_status IN ('OK', 'FLAGGED') THEN air_draft_status ELSE est_height_status END
+            = 'FLAGGED'
+        ) DESC, last_position_at DESC
         """,
         (cutoff,),
     ).fetchall()

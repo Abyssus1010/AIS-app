@@ -18,17 +18,34 @@
   .badge-UNKNOWN { background: #3a2e0f; color: #fbbf24; }
   .name-guessed { color: #fbbf24; cursor: help; margin-left: 0.3rem; }
   .low-confidence { color: #fbbf24; cursor: help; margin-left: 0.3rem; font-size: 0.85em; }
+  .source-web { color: #7db4ff; cursor: help; margin-left: 0.35rem; font-size: 0.85em; }
   .muted { color: #9aa4b2; }
   a { color: #7db4ff; }
   .empty { color: #9aa4b2; padding: 2rem 0; text-align: center; }
+
+  .threshold-form { display: inline-flex; align-items: center; gap: 0.4rem; margin: 0 0.15rem; }
+  .threshold-form input { width: 4.5rem; background: #161b22; border: 1px solid #232833; border-radius: 4px;
+                           color: #e6e6e6; padding: 0.15rem 0.4rem; font-size: 0.85rem; }
+  .threshold-form button { background: #1c2530; border: 1px solid #2b3a55; border-radius: 4px; color: #7db4ff;
+                            padding: 0.15rem 0.6rem; font-size: 0.8rem; cursor: pointer; }
+  .threshold-form button:hover { background: #2b3a55; }
+  .threshold-status { font-size: 0.8rem; margin-top: 0.3rem; min-height: 1.2em; }
+  .threshold-status.error { color: #f87171; }
+  .threshold-status.success { color: #4ade80; }
 </style>
 </head>
 <body>
   <h1>AIS Vessel Height Monitor</h1>
   <div class="subtitle">
-    Flagging vessels with an estimated height &gt; {{ threshold_ft }} ft (from AIS type + length) &middot;
+    Flagging vessels with a height &gt;
+    <span class="threshold-form">
+      <input type="number" id="threshold-input" value="{{ "%.0f"|format(threshold_ft) }}" min="1" max="1000" step="1">
+      <button id="threshold-save" type="button">Set</button>
+    </span>
+    ft (web-search-confirmed air draft where found &#127760;, else estimated from AIS type + length) &middot;
     showing vessels seen in the last {{ silence_window_minutes|int }} min
   </div>
+  <div id="threshold-status" class="threshold-status"></div>
 
   <table>
     <thead>
@@ -40,11 +57,12 @@
         <th>Last seen</th>
         <th>Status</th>
         <th>Est. height</th>
+        <th>Air draft</th>
       </tr>
     </thead>
     <tbody id="vessel-body">
       {% if not vessels %}
-      <tr><td colspan="7" class="empty">No vessels currently in range</td></tr>
+      <tr><td colspan="8" class="empty">No vessels currently in range</td></tr>
       {% endif %}
       {% for v in vessels %}
       <tr>
@@ -53,8 +71,17 @@
         <td>{{ v.imo or "—" }}</td>
         <td>{{ "%.4f, %.4f"|format(v.lat, v.lon) if v.lat is not none else "—" }}</td>
         <td>{{ v.last_position_at or "—" }}</td>
-        <td><span class="badge badge-{{ v.est_height_status }}">{{ v.est_height_status }}</span>{% if v.est_height_confidence == "low" %}<span class="low-confidence" title="{{ v.est_height_note }}">&#9888;</span>{% endif %}</td>
-        <td>{% if v.est_height_ft is not none %}<a href="/vessel/{{ v.mmsi }}">{{ "%.0f ft"|format(v.est_height_ft) }}</a>{% else %}—{% endif %}</td>
+        <td><span class="badge badge-{{ v.status }}">{{ v.status }}</span>{% if v.height_source == "air_draft_search" %}<span class="source-web" title="Effective verdict comes from the confirmed air draft (right), not the type+size table estimate">&#127760;</span>{% endif %}</td>
+        <td>{% if v.est_height_ft is not none %}<a href="/vessel/{{ v.mmsi }}">{{ "%.0f ft"|format(v.est_height_ft) }}</a>{% else %}—{% endif %}{% if v.est_height_confidence == "low" %}<span class="low-confidence" title="{{ v.est_height_note }}">&#9888;</span>{% endif %}</td>
+        <td>
+          {% if v.air_draft_status in ("OK", "FLAGGED") %}
+          <a href="/vessel/{{ v.mmsi }}" title="{{ v.air_draft_source_title or v.air_draft_source_url or '' }}">{{ "%.0f ft"|format(v.air_draft_value_ft) if v.air_draft_value_ft is not none else v.air_draft_value_raw }}</a>{% if v.air_draft_identity == "name_proximity" %}<span class="low-confidence" title="Weak identity match - name matched nearby, not a declared NAME/IMO field; verify manually">&#9888;</span>{% endif %}
+          {% elif v.air_draft_status == "PENDING" %}
+          <span class="muted">searching&hellip;</span>
+          {% else %}
+          <span class="muted">—</span>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </tbody>
@@ -80,13 +107,31 @@ function escAttr(s) {
 
 function fmtEstHeight(v) {
   if (v.est_height_ft == null) return "—";
-  return `<a href="/vessel/${v.mmsi}">${v.est_height_ft.toFixed(0)} ft</a>`;
+  const link = `<a href="/vessel/${v.mmsi}">${v.est_height_ft.toFixed(0)} ft</a>`;
+  const lowConf = v.est_height_confidence === "low"
+    ? `<span class="low-confidence" title="${escAttr(v.est_height_note)}">&#9888;</span>`
+    : "";
+  return link + lowConf;
+}
+
+function fmtAirDraft(v) {
+  if (v.air_draft_status === "OK" || v.air_draft_status === "FLAGGED") {
+    const label = v.air_draft_value_ft != null ? `${v.air_draft_value_ft.toFixed(0)} ft` : v.air_draft_value_raw;
+    const title = escAttr(v.air_draft_source_title || v.air_draft_source_url || "");
+    const link = `<a href="/vessel/${v.mmsi}" title="${title}">${label}</a>`;
+    const weak = v.air_draft_identity === "name_proximity"
+      ? `<span class="low-confidence" title="Weak identity match - name matched nearby, not a declared NAME/IMO field; verify manually">&#9888;</span>`
+      : "";
+    return link + weak;
+  }
+  if (v.air_draft_status === "PENDING") return `<span class="muted">searching&hellip;</span>`;
+  return `<span class="muted">—</span>`;
 }
 
 function render(vessels) {
   const body = document.getElementById("vessel-body");
   if (!vessels.length) {
-    body.innerHTML = `<tr><td colspan="7" class="empty">No vessels currently in range</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" class="empty">No vessels currently in range</td></tr>`;
     return;
   }
   body.innerHTML = vessels.map(v => `
@@ -96,8 +141,9 @@ function render(vessels) {
       <td>${v.imo ?? "—"}</td>
       <td>${v.lat != null ? v.lat.toFixed(4) + ", " + v.lon.toFixed(4) : "—"}</td>
       <td>${fmtAgo(v.last_position_at)}</td>
-      <td>${badge(v.est_height_status)}${v.est_height_confidence === "low" ? `<span class="low-confidence" title="${escAttr(v.est_height_note)}">&#9888;</span>` : ""}</td>
+      <td>${badge(v.status)}${v.height_source === "air_draft_search" ? `<span class="source-web" title="Effective verdict comes from the confirmed air draft (right), not the type+size table estimate">&#127760;</span>` : ""}</td>
       <td>${fmtEstHeight(v)}</td>
+      <td>${fmtAirDraft(v)}</td>
     </tr>
   `).join("");
 }
@@ -111,6 +157,50 @@ async function poll() {
     console.error("poll failed", e);
   }
 }
+
+function setThresholdStatus(message, cls) {
+  const el = document.getElementById("threshold-status");
+  el.textContent = message;
+  el.className = "threshold-status" + (cls ? ` ${cls}` : "");
+}
+
+async function saveThreshold() {
+  const input = document.getElementById("threshold-input");
+  const value = parseFloat(input.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    setThresholdStatus("Enter a positive number of feet.", "error");
+    return;
+  }
+  // This re-flags every vessel currently in the table (see
+  // db.set_height_threshold_ft), not just ones seen from now on - worth a
+  // confirm click given it's a live safety-flagging threshold, not just a
+  // display preference.
+  if (!confirm(`Set the flag threshold to ${value} ft? This re-flags every vessel shown, not just new ones.`)) {
+    return;
+  }
+  try {
+    const resp = await fetch("/api/settings/height-threshold", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ threshold_ft: value }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      const detail = Array.isArray(err.detail) ? err.detail.map(d => d.msg).join("; ") : (err.detail || resp.statusText);
+      setThresholdStatus(`Failed: ${detail}`, "error");
+      return;
+    }
+    setThresholdStatus(`Threshold set to ${value} ft.`, "success");
+    poll();
+  } catch (e) {
+    setThresholdStatus(`Failed: ${e}`, "error");
+  }
+}
+
+document.getElementById("threshold-save").addEventListener("click", saveThreshold);
+document.getElementById("threshold-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") saveThreshold();
+});
 
 setInterval(poll, 10000);
 </script>

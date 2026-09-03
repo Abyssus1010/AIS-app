@@ -5,14 +5,19 @@ live AIS traffic, estimates each vessel's height above the waterline from its
 AIS-broadcast type and length, and flags any vessel tall enough to be a
 hazard to aircraft using Changi's runways - on a live-updating dashboard.
 
-An earlier version resolved each vessel's actual air draft via a web search
-(fetching ship-particulars pages/PDFs, OCR'ing scanned ones). That approach
-was dropped: a genuine, publicly-published air draft figure turned out to
-exist for only a minority of vessels, however thorough the search. The
-current approach trades that occasional precision for a free, instant
-estimate that's available for every vessel with AIS static data - see
-`app/vessel_height_table.py`'s docstring for the type+size table and its
-confidence caveats.
+Each vessel's height is resolved two ways, in order. First, a web search for
+the vessel's own published air draft (fetching ship-particulars pages/PDFs,
+OCR'ing scanned ones - `app/air_draft_resolver.py`). A genuine,
+publicly-published air draft figure only exists for a minority of vessels
+however thorough the search, so this was dropped for a stretch in favor of
+the second method alone; it's since been reinstated as a first pass rather
+than the sole method, specifically so its occasional real per-vessel
+precision isn't left on the table. Whatever it can't confirm falls back
+instantly to a preset type+size table (`app/vessel_height_table.py`) driven
+by AIS-broadcast type and length alone - no network call, no per-vessel
+search, and available for every vessel with AIS static data. See that
+module's docstring for the table itself and its confidence caveats, and
+`app/worker.py`'s `run_air_draft_lookup` for how the two are sequenced.
 
 The repo has two parts:
 
@@ -20,10 +25,12 @@ The repo has two parts:
   vessel state, estimates height from type+size, and serves the dashboard.
   This is what `Dockerfile`/`docker-compose.yml` build and run.
 - **`aisstream.py`** and **`air_draft_lookup.py`** - two standalone, independent
-  scripts kept at the repo root for quick manual testing, unrelated to the
-  app's current height-estimation approach. `app/ais_client.py` began as a
-  productionized port of `aisstream.py` (adding DB persistence); see each
-  script's own section below for what they do on their own.
+  scripts kept at the repo root for quick manual testing. `app/ais_client.py`
+  began as a productionized port of `aisstream.py` (adding DB persistence);
+  `app/air_draft_resolver.py` is likewise a productionized port of
+  `air_draft_lookup.py` (LangSearch as primary search backend instead of
+  DuckDuckGo alone, structured results instead of print()/file output). See
+  each script's own section below for what they do on their own.
 
 ---
 
@@ -44,12 +51,25 @@ The repo has two parts:
    the table doesn't cover, e.g. sailing vessels whose height is set by mast
    rigging rather than hull size). See that module's docstring for why
    several categories carry a `low` confidence estimate.
-4. Serves a **dashboard** (`app/main.py` + `app/templates/dashboard.html`)
+4. Separately, once a vessel has a name, `app/worker.py`'s
+   `run_air_draft_lookup` **searches the web for that vessel's own published
+   air draft** (`app/air_draft_resolver.py`) - LangSearch, falling back to
+   DuckDuckGo, for ship-particulars pages/PDFs (OCR'd if scanned), confirmed
+   against the vessel's own name/IMO before being trusted. A confirmed
+   result *overrides* the type+size table's estimate for that vessel's
+   `OK`/`FLAGGED` verdict (`app/main.py`'s `_effective_height`); anything
+   this can't confirm just leaves the table estimate as the vessel's
+   verdict, which was already computed for free in step 3. This is far more
+   expensive per vessel than every other lookup here (up to 3 search
+   queries, each fanning out to a dozen page/PDF fetches) - see
+   `AIR_DRAFT_LOOKUP_ENABLED`/`AIR_DRAFT_RETRY_HOURS` below to disable it or
+   tune its retry backoff.
+5. Serves a **dashboard** (`app/main.py` + `app/templates/dashboard.html`)
    listing every vessel seen recently, sorted with `FLAGGED` vessels first,
    and a **vessel detail page** that visually breaks down how each estimate
    was derived (type → category → size bracket → table value → threshold
    verdict). The dashboard polls `GET /api/vessels` every 10s to stay live.
-5. Separately, **vessels with no name at all** (AIS hasn't yet delivered a
+6. Separately, **vessels with no name at all** (AIS hasn't yet delivered a
    static-data message for them - only position reports so far, shown on the
    dashboard as `MMSI <n>`) are queued for a best-effort name guess from the
    MMSI alone (`app/worker.py` + `app/vessel_name_lookup.py`) - see below.
@@ -113,6 +133,8 @@ All other variables are optional (defaults live in `app/config.py`):
 | `HEIGHT_THRESHOLD_FT` | `70` | Estimated height above this (in feet) is flagged |
 | `SILENCE_WINDOW_MINUTES` | `30` | How long a vessel stays on the dashboard after its last position report |
 | `LOOKUP_CONCURRENCY` | `3` | Number of concurrent MMSI-to-name lookup workers |
+| `AIR_DRAFT_LOOKUP_ENABLED` | `true` | Master switch for the web-search air draft lookup (`app/air_draft_resolver.py`) - set `false` to rely on the type+size table alone |
+| `AIR_DRAFT_RETRY_HOURS` | `12` | How long to wait before retrying a vessel whose air draft search came back `UNKNOWN` |
 | `DB_PATH` | `./ais.db` | SQLite file location (Docker sets this to `/data/ais.db`) |
 
 ### Run locally

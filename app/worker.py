@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from app import config, db
+from app import air_draft_resolver, config, db
 from app.state import IN_FLIGHT
 from app.vessel_name_lookup import resolve_vessel_name
 
@@ -148,6 +148,56 @@ async def run_loa_backfill() -> None:
                         "Guessed length overall for mmsi=%s from a retry search: %.0f m (unverified)",
                         row["mmsi"], loa_m,
                     )
+
+        await asyncio.sleep(STALE_SWEEP_INTERVAL_SECONDS)
+
+
+async def run_air_draft_lookup() -> None:
+    """Searches the web for each vessel's own published air draft (see
+    air_draft_resolver.resolve_air_draft), ahead of the type+size table's
+    generic estimate - db.set_air_draft_result only writes while a vessel is
+    still PENDING/UNKNOWN, and main._effective_height prefers a confirmed
+    air_draft_* result over est_height_* whenever one exists, so the type+
+    size table naturally stays the fallback for anything this loop hasn't
+    resolved yet (or never will).
+
+    Gated on config.AIR_DRAFT_LOOKUP_ENABLED since this is far more expensive
+    per vessel than the other lookups here (see its docstring). A vessel
+    needs a name before it's queryable at all (db.
+    get_vessels_needing_air_draft_lookup already filters on that), so this
+    naturally runs after a name has resolved - real or guessed - rather than
+    racing it.
+
+    Deliberately sequential, not a concurrent pool like run_lookup_worker:
+    LangSearch calls are already serialized behind one shared throttle
+    regardless (see vessel_name_lookup._throttle), so concurrency here would
+    only parallelize the page-fetch/OCR portion at the cost of hammering
+    external hosts harder - matches run_imo_backfill/run_category_backfill/
+    run_loa_backfill's own single-sequential-loop style for this same reason."""
+    if not config.AIR_DRAFT_LOOKUP_ENABLED:
+        logger.info("Air draft web-search lookup disabled (AIR_DRAFT_LOOKUP_ENABLED=false)")
+        return
+
+    while True:
+        for row in await asyncio.to_thread(
+            db.get_vessels_needing_air_draft_lookup, config.SILENCE_WINDOW_MINUTES, config.AIR_DRAFT_RETRY_HOURS
+        ):
+            try:
+                result = await asyncio.to_thread(
+                    air_draft_resolver.resolve_air_draft, row["name"], row["imo"]
+                )
+            except air_draft_resolver.LookupError:
+                logger.warning(
+                    "Air draft lookup failed entirely for mmsi=%s (%r), will retry later",
+                    row["mmsi"], row["name"],
+                )
+                continue
+            await asyncio.to_thread(db.set_air_draft_result, row["mmsi"], result)
+            logger.info(
+                "Air draft lookup for mmsi=%s (%r): %s%s",
+                row["mmsi"], row["name"], result.status,
+                f" ({result.value_raw} from {result.source_url})" if result.value_raw else "",
+            )
 
         await asyncio.sleep(STALE_SWEEP_INTERVAL_SECONDS)
 

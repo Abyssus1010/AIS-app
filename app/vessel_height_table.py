@@ -7,7 +7,8 @@ no rate limit, and returns instantly for any vessel with static data.
 
 The number returned is a rough, deliberately conservative (upper-bound)
 estimate of the vessel's height above the waterline (i.e. directly
-comparable to config.HEIGHT_THRESHOLD_FT), NOT a certified figure - see the
+comparable to the app's flag threshold - see db.get_height_threshold_ft
+for the live, user-adjustable value), NOT a certified figure - see the
 docstring on HeightEstimate.confidence for why several buckets are much less
 reliable than others, and REVIEW.md-style: these numbers are compiled from
 general public naval-architecture reference points (canal/bridge air-draft
@@ -113,7 +114,8 @@ class HeightEstimate:
 
 
 # Values are a conservative (upper-end-of-observed-range) height above the
-# waterline, in feet, directly comparable to config.HEIGHT_THRESHOLD_FT. Sources/
+# waterline, in feet, directly comparable to the app's flag threshold (see
+# db.get_height_threshold_ft for the live, user-adjustable value). Sources/
 # reasoning per bracket:
 #
 # CARGO - biased to the tallest common subtype at that size, since AIS can't
@@ -142,10 +144,12 @@ class HeightEstimate:
 # carriers sharing this same AIS code range, which the table biases toward:
 #   small (<100m):    coastal chemical/product tankers, RIDING IN BALLAST -
 #                      a loaded coastal tanker sits closer to ~20m/66ft, but
-#                      that's within a few feet of config.HEIGHT_THRESHOLD_FT
-#                      (70ft default), and a tanker in ballast rides
-#                      meaningfully higher out of the water than loaded (see
-#                      very_large below, same effect) - bumped up to keep a
+#                      that's within a few feet of the app's flag threshold
+#                      (70ft by default - see db.get_height_threshold_ft for
+#                      the live, user-adjustable value), and a tanker in
+#                      ballast rides meaningfully higher out of the water
+#                      than loaded (see very_large below, same effect) -
+#                      bumped up to keep a
 #                      margin above the flag threshold instead of sitting
 #                      just under it on an unverified loaded-only figure -> 24m / 79ft
 #   medium (100-200m): MR product/chemical tankers                         -> 28m / 92ft
