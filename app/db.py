@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -101,16 +102,22 @@ def init_schema() -> None:
             _get_conn().execute(f"ALTER TABLE vessels ADD COLUMN {column} {ddl}")
 
     # Small key/value store for settings a user can change at runtime from
-    # the dashboard (currently just the height flag threshold - see
-    # get_height_threshold_ft/set_height_threshold_ft) rather than only via
-    # an env var at container start. Seeded from config.DEFAULT_HEIGHT_THRESHOLD_FT
-    # on first run against a given DB; a value already present (a prior
-    # user-set threshold, surviving a restart/redeploy) is left untouched.
+    # the dashboard (the height flag threshold and the AIS monitoring zone -
+    # see get_height_threshold_ft/set_height_threshold_ft and
+    # get_bounding_box/set_bounding_box) rather than only via an env var at
+    # container start. Each key is seeded from its config default on first
+    # run against a given DB; a value already present (a prior user-set
+    # value, surviving a restart/redeploy) is left untouched.
     _get_conn().execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     _get_conn().execute(
         "INSERT INTO settings (key, value) VALUES ('height_threshold_ft', ?) "
         "ON CONFLICT(key) DO NOTHING",
         (str(config.DEFAULT_HEIGHT_THRESHOLD_FT),),
+    )
+    _get_conn().execute(
+        "INSERT INTO settings (key, value) VALUES ('monitoring_bbox', ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (json.dumps(config.DEFAULT_BOUNDING_BOX),),
     )
     _get_conn().commit()
 
@@ -158,6 +165,50 @@ def set_height_threshold_ft(value: float) -> None:
         (value,),
     )
     conn.commit()
+
+
+def get_bounding_box() -> list:
+    """The live AIS monitoring zone, as [[sw_lat, sw_lon], [ne_lat, ne_lon]] -
+    what ais_client.py actually subscribes AISStream to on every (re)connect,
+    not config.DEFAULT_BOUNDING_BOX directly, so a zone set via
+    set_bounding_box takes effect on the next reconnect (see
+    ais_client.request_reconnect for forcing one immediately) without a
+    container restart."""
+    row = _get_conn().execute("SELECT value FROM settings WHERE key = 'monitoring_bbox'").fetchone()
+    return json.loads(row["value"]) if row is not None else config.DEFAULT_BOUNDING_BOX
+
+
+def _in_current_zone_sql() -> tuple[str, tuple]:
+    """SQL fragment + params confining a query to the live monitoring zone
+    (see get_bounding_box) - shared by get_active_vessels (what the
+    dashboard shows) and every get_vessels_needing_* lookup query below, so
+    a vessel that just dropped off the dashboard because it's outside the
+    zone also stops consuming LangSearch/DuckDuckGo lookup budget for the
+    same reason: nobody can see it right now, so resolving its name/IMO/
+    category/air draft buys nothing until the zone covers it again - at
+    which point it's back in scope for both, instantly, with no separate
+    step needed."""
+    sw, ne = get_bounding_box()
+    return "last_lat BETWEEN ? AND ? AND last_lon BETWEEN ? AND ?", (sw[0], ne[0], sw[1], ne[1])
+
+
+def set_bounding_box(bbox: list) -> None:
+    """Changes the live AIS monitoring zone (see get_bounding_box). Unlike
+    set_height_threshold_ft, this has nothing to retroactively re-derive in
+    the DB - existing vessel rows are untouched. A vessel that falls outside
+    the new zone drops off the dashboard immediately, not just once it goes
+    silent (see get_active_vessels and _in_current_zone_sql), and the same
+    lookup queries stop selecting it for the same reason - but its row and
+    everything already resolved about it stay as-is, ready to reappear
+    (dashboard and lookups both) the instant the zone covers it again.
+    The caller (main.py's endpoint) is responsible for actually reconnecting
+    the AIS stream with the new zone - this function only persists it."""
+    _get_conn().execute(
+        "INSERT INTO settings (key, value) VALUES ('monitoring_bbox', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (json.dumps(bbox),),
+    )
+    _get_conn().commit()
 
 
 def _utcnow_iso() -> str:
@@ -489,24 +540,27 @@ def get_vessels_needing_air_draft_lookup(
     silence_window_minutes: float, retry_after_hours: float
 ) -> list[sqlite3.Row]:
     """Vessels due for a web-search air draft lookup: named (the search needs
-    something to query for), and either never yet attempted (PENDING) or
+    something to query for), currently inside the live monitoring zone (see
+    _in_current_zone_sql - no point spending a search on a vessel that just
+    dropped off the dashboard), and either never yet attempted (PENDING) or
     attempted but unresolved (UNKNOWN) longer than retry_after_hours ago -
     see config.AIR_DRAFT_RETRY_HOURS for why UNKNOWN gets a much longer
     backoff than the other lookups' fixed sweep interval. A confirmed result
     (OK/FLAGGED) never reappears here - see set_air_draft_result."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
     retry_cutoff = (datetime.now(timezone.utc) - timedelta(hours=retry_after_hours)).isoformat()
+    zone_sql, zone_params = _in_current_zone_sql()
     conn = _get_conn()
     return conn.execute(
-        """
+        f"""
         SELECT mmsi, name, imo FROM vessels
-        WHERE name IS NOT NULL AND last_position_at >= ?
+        WHERE name IS NOT NULL AND last_position_at >= ? AND {zone_sql}
           AND (
             air_draft_status = 'PENDING'
             OR (air_draft_status = 'UNKNOWN' AND (air_draft_checked_at IS NULL OR air_draft_checked_at < ?))
           )
         """,
-        (position_cutoff, retry_cutoff),
+        (position_cutoff, *zone_params, retry_cutoff),
     ).fetchall()
 
 
@@ -516,50 +570,67 @@ def get_vessel(mmsi: int) -> sqlite3.Row | None:
 
 
 def get_active_vessels(silence_window_minutes: float) -> list[sqlite3.Row]:
+    """Vessels for the dashboard: seen recently (within silence_window_minutes)
+    AND currently inside the live monitoring zone (see get_bounding_box) -
+    a vessel whose last known position falls outside the zone drops off this
+    list the moment the zone changes, rather than lingering at its last (now
+    stale) position for up to silence_window_minutes. This is a display
+    filter only, not a deletion: the row itself, and everything already
+    resolved about it (name, category, air draft lookup result), is left
+    untouched (see set_bounding_box's docstring) - the vessel reappears here
+    instantly, with no re-lookup needed, if the zone is ever moved back to
+    cover it. A vessel with no position yet (last_lat/last_lon NULL) was
+    already excluded by the last_position_at check before this filter
+    existed, so this doesn't change that case."""
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    zone_sql, zone_params = _in_current_zone_sql()
     conn = _get_conn()
     return conn.execute(
-        """
+        f"""
         SELECT * FROM vessels
-        WHERE last_position_at >= ?
+        WHERE last_position_at >= ? AND {zone_sql}
         ORDER BY (
             CASE WHEN air_draft_status IN ('OK', 'FLAGGED') THEN air_draft_status ELSE est_height_status END
             = 'FLAGGED'
         ) DESC, last_position_at DESC
         """,
-        (cutoff,),
+        (cutoff, *zone_params),
     ).fetchall()
 
 
 def get_vessels_needing_name_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
     """Vessels with a recent position but no name yet - AIS hasn't delivered
-    a static-data message for them. Scoped to the same silence window as
-    dashboard visibility: a vessel that's gone quiet longer than that won't
-    be retried until it's heard from again, so workers aren't spent
-    re-resolving vessels nobody can currently see."""
+    a static-data message for them. Scoped to the same silence window AND
+    the same live monitoring zone as dashboard visibility (see
+    _in_current_zone_sql): a vessel that's gone quiet, or fallen outside the
+    zone, won't be retried until it's both back in range and visible again,
+    so workers aren't spent re-resolving vessels nobody can currently see."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    zone_sql, zone_params = _in_current_zone_sql()
     conn = _get_conn()
     return conn.execute(
-        """
+        f"""
         SELECT mmsi FROM vessels
-        WHERE name IS NULL AND last_position_at >= ?
+        WHERE name IS NULL AND last_position_at >= ? AND {zone_sql}
         """,
-        (position_cutoff,),
+        (position_cutoff, *zone_params),
     ).fetchall()
 
 
 def get_vessels_needing_imo_lookup(silence_window_minutes: float) -> list[sqlite3.Row]:
     """Vessels whose name is known but whose IMO never arrived - see
-    worker.run_imo_backfill for why. Scoped to the same silence window as
-    dashboard visibility, same reasoning as get_vessels_needing_name_lookup."""
+    worker.run_imo_backfill for why. Scoped to the same silence window and
+    live monitoring zone as dashboard visibility, same reasoning as
+    get_vessels_needing_name_lookup."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    zone_sql, zone_params = _in_current_zone_sql()
     conn = _get_conn()
     return conn.execute(
-        """
+        f"""
         SELECT mmsi FROM vessels
-        WHERE (imo IS NULL OR imo = 0) AND name IS NOT NULL AND last_position_at >= ?
+        WHERE (imo IS NULL OR imo = 0) AND name IS NOT NULL AND last_position_at >= ? AND {zone_sql}
         """,
-        (position_cutoff,),
+        (position_cutoff, *zone_params),
     ).fetchall()
 
 
@@ -571,17 +642,19 @@ def get_vessels_needing_category_lookup(silence_window_minutes: float) -> list[s
     resolved their name/IMO happened to hit a result title
     vessel_name_lookup._category_from_title couldn't parse (e.g. a
     different tracker site's title shape) - in practice the majority case,
-    not a rare edge case."""
+    not a rare edge case. Also scoped to the live monitoring zone (see
+    _in_current_zone_sql), same reasoning as get_vessels_needing_name_lookup."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    zone_sql, zone_params = _in_current_zone_sql()
     conn = _get_conn()
     return conn.execute(
-        """
+        f"""
         SELECT mmsi FROM vessels
         WHERE ais_type IS NULL AND category_guessed = 0
           AND name IS NOT NULL AND imo IS NOT NULL AND imo != 0
-          AND last_position_at >= ?
+          AND last_position_at >= ? AND {zone_sql}
         """,
-        (position_cutoff,),
+        (position_cutoff, *zone_params),
     ).fetchall()
 
 
@@ -593,17 +666,20 @@ def get_vessels_needing_loa_lookup(silence_window_minutes: float) -> list[sqlite
     missing name, IMO, or category get an LOA extraction attempt for free as
     a byproduct of those loops' own searches (see worker._guess_and_save /
     run_imo_backfill / run_category_backfill) - this covers only the
-    otherwise-fully-resolved residual case."""
+    otherwise-fully-resolved residual case. Also scoped to the live
+    monitoring zone (see _in_current_zone_sql), same reasoning as
+    get_vessels_needing_name_lookup."""
     position_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=silence_window_minutes)).isoformat()
+    zone_sql, zone_params = _in_current_zone_sql()
     conn = _get_conn()
     return conn.execute(
-        """
+        f"""
         SELECT mmsi FROM vessels
         WHERE ais_type IS NOT NULL AND loa_m IS NULL
           AND name IS NOT NULL AND imo IS NOT NULL AND imo != 0
-          AND last_position_at >= ?
+          AND last_position_at >= ? AND {zone_sql}
         """,
-        (position_cutoff,),
+        (position_cutoff, *zone_params),
     ).fetchall()
 
 

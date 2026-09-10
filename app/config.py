@@ -13,11 +13,17 @@ LANGSEARCH_API_KEY = os.environ["LANGSEARCH_API_KEY"]
 # threshold, 1.32239N 103.99985E - the point on that runway closest to the
 # sea). AISStream only supports a rectangular bounding box, so this covers
 # the cone plus some extra area outside it rather than the cone exactly.
-_DEFAULT_BOUNDING_BOX = [[1.1558, 103.9165], [1.3224, 104.0832]]
-BOUNDING_BOX = (
+#
+# Like DEFAULT_HEIGHT_THRESHOLD_FT below, this is only the SEED value for
+# the DB-backed setting (db.init_schema) the first time the app runs against
+# a given DB. The live zone - user-adjustable from the dashboard - lives in
+# the `settings` table from then on (db.get_bounding_box/set_bounding_box);
+# ais_client.py reads that on every (re)connect rather than this constant.
+_HARDCODED_DEFAULT_BOUNDING_BOX = [[1.1558, 103.9165], [1.3224, 104.0832]]
+DEFAULT_BOUNDING_BOX = (
     json.loads(os.environ["AIS_BOUNDING_BOX"])
     if os.environ.get("AIS_BOUNDING_BOX")
-    else _DEFAULT_BOUNDING_BOX
+    else _HARDCODED_DEFAULT_BOUNDING_BOX
 )
 
 # Single flag threshold, compared against whichever height figure is

@@ -4,22 +4,43 @@ import logging
 import random
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from app import config, db
 
 logger = logging.getLogger(__name__)
 
-SUBSCRIPTION = {
-    "APIKey": config.API_KEY,
-    "BoundingBoxes": [config.BOUNDING_BOX],
-    "FilterMessageTypes": [
-        "PositionReport",
-        "StandardClassBPositionReport",
-        "ExtendedClassBPositionReport",
-        "ShipStaticData",
-        "StaticDataReport",
-    ],
-}
+FILTER_MESSAGE_TYPES = [
+    "PositionReport",
+    "StandardClassBPositionReport",
+    "ExtendedClassBPositionReport",
+    "ShipStaticData",
+    "StaticDataReport",
+]
+
+# Holds the currently open AISStream connection, if any - lets
+# request_reconnect() (called from outside this module, after a UI-driven
+# monitoring-zone change) force run_ingestion() to drop it and reconnect
+# with a freshly-read bounding box, rather than only picking up the new zone
+# whenever the connection next happens to drop on its own, which could be
+# hours away. websockets' close() is safe to call from a different task than
+# the one reading the connection - that's the officially supported way to
+# interrupt it, but doing so while a recv() is in flight surfaces as a
+# ConnectionClosedError on the reading side (observed in practice: "sent
+# 1000 (OK); no close frame received") rather than the iterator just
+# stopping cleanly - _reconnect_requested lets run_ingestion tell that kind
+# of closure apart from a genuine dropped connection, so a deliberate zone
+# change reconnects immediately and quietly instead of being logged as an
+# error and going through the backoff delay meant for real outages.
+_current_ws: websockets.WebSocketClientProtocol | None = None
+_reconnect_requested = False
+
+
+async def request_reconnect() -> None:
+    global _reconnect_requested
+    _reconnect_requested = True
+    if _current_ws is not None:
+        await _current_ws.close()
 
 
 def _clean_name(raw) -> str | None:
@@ -90,13 +111,33 @@ async def _handle_message(data: dict) -> None:
 
 
 async def run_ingestion() -> None:
+    global _current_ws, _reconnect_requested
     backoff = 2.0
     while True:
         try:
+            # Read fresh on every (re)connect, not once at import time - a
+            # UI-driven monitoring-zone change (see db.set_bounding_box) only
+            # takes effect starting with the next connection, which is why
+            # request_reconnect() exists to force one immediately instead of
+            # waiting for the current connection to drop on its own.
+            bounding_box = await asyncio.to_thread(db.get_bounding_box)
+            subscription = {
+                "APIKey": config.API_KEY,
+                "BoundingBoxes": [bounding_box],
+                "FilterMessageTypes": FILTER_MESSAGE_TYPES,
+            }
             async with websockets.connect("wss://stream.aisstream.io/v0/stream") as ws:
-                await ws.send(json.dumps(SUBSCRIPTION))
-                logger.info("Connected to aisstream.io")
+                _current_ws = ws
+                await ws.send(json.dumps(subscription))
+                logger.info("Connected to aisstream.io (zone=%s)", bounding_box)
                 backoff = 2.0
+                # A request_reconnect() call that raced with (and lost to)
+                # this connection attempt already succeeding - the fresh
+                # bounding_box read above already picked up whatever change
+                # triggered it, so there's nothing left to act on. Clearing
+                # it here stops it from misattributing some later, unrelated
+                # disconnect to this one.
+                _reconnect_requested = False
                 async for raw in ws:
                     try:
                         await _handle_message(json.loads(raw))
@@ -104,9 +145,25 @@ async def run_ingestion() -> None:
                         logger.exception("Error handling AIS message")
         except asyncio.CancelledError:
             raise
+        except ConnectionClosed:
+            if _reconnect_requested:
+                # Our own request_reconnect() caused this - see its comment
+                # above for why it surfaces as a ConnectionClosed here rather
+                # than the async-for just stopping. Reconnect immediately,
+                # no backoff and no scary log line: this wasn't an outage.
+                _reconnect_requested = False
+                logger.info("Reconnecting AIS stream for a monitoring-zone change")
+            else:
+                logger.warning(
+                    "AIS connection lost, reconnecting in %.1fs", backoff, exc_info=True
+                )
+                await asyncio.sleep(backoff + random.uniform(0, backoff * 0.1))
+                backoff = min(backoff * 2, 60.0)
         except Exception:
             logger.warning(
                 "AIS connection lost, reconnecting in %.1fs", backoff, exc_info=True
             )
             await asyncio.sleep(backoff + random.uniform(0, backoff * 0.1))
             backoff = min(backoff * 2, 60.0)
+        finally:
+            _current_ws = None

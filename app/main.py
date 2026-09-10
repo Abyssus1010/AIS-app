@@ -5,9 +5,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app import config, db, vessel_height_table
+from app import ais_client
 from app.ais_client import run_ingestion
 from app.worker import (
     run_air_draft_lookup,
@@ -206,10 +207,54 @@ async def set_height_threshold(payload: HeightThresholdUpdate):
     return {"threshold_ft": payload.threshold_ft}
 
 
+class BoundingBoxUpdate(BaseModel):
+    sw_lat: float = Field(ge=-90, le=90)
+    sw_lon: float = Field(ge=-180, le=180)
+    ne_lat: float = Field(ge=-90, le=90)
+    ne_lon: float = Field(ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def _check_order(self):
+        # Doesn't handle a zone crossing the antimeridian (sw_lon > ne_lon
+        # wrapping around 180/-180) - out of scope for this app, which only
+        # ever monitors a patch of sea off Singapore, nowhere near it.
+        if self.sw_lat >= self.ne_lat:
+            raise ValueError("south-west latitude must be less than north-east latitude")
+        if self.sw_lon >= self.ne_lon:
+            raise ValueError("south-west longitude must be less than north-east longitude")
+        return self
+
+
+@app.get("/api/settings/monitoring-zone")
+async def get_monitoring_zone():
+    sw, ne = await asyncio.to_thread(db.get_bounding_box)
+    return {"sw_lat": sw[0], "sw_lon": sw[1], "ne_lat": ne[0], "ne_lon": ne[1]}
+
+
+@app.post("/api/settings/monitoring-zone")
+async def set_monitoring_zone(payload: BoundingBoxUpdate):
+    """Lets a user redraw the AIS monitoring zone from the dashboard instead
+    of only via the AIS_BOUNDING_BOX env var at container start. Persists the
+    new zone (db.set_bounding_box) and then forces an immediate AIS
+    reconnect (ais_client.request_reconnect) so it takes effect right away -
+    without that second step the new zone would just sit unused until the
+    current AISStream connection happened to drop on its own, which could be
+    a long wait. Existing vessel rows are left as-is; ones now outside the
+    zone simply stop receiving position updates and age off the dashboard
+    naturally after SILENCE_WINDOW_MINUTES, the same as any vessel that goes
+    quiet (see db.set_bounding_box's docstring)."""
+    bbox = [[payload.sw_lat, payload.sw_lon], [payload.ne_lat, payload.ne_lon]]
+    await asyncio.to_thread(db.set_bounding_box, bbox)
+    await ais_client.request_reconnect()
+    logger.info("Monitoring zone changed to %s via the dashboard; reconnecting AIS stream", bbox)
+    return {"bounding_box": bbox}
+
+
 @app.get("/")
 async def dashboard(request: Request):
     rows = await asyncio.to_thread(db.get_active_vessels, config.SILENCE_WINDOW_MINUTES)
     threshold_ft = await asyncio.to_thread(db.get_height_threshold_ft)
+    bounding_box = await asyncio.to_thread(db.get_bounding_box)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -217,6 +262,7 @@ async def dashboard(request: Request):
             "vessels": [_serialize(r) for r in rows],
             "threshold_ft": threshold_ft,
             "silence_window_minutes": config.SILENCE_WINDOW_MINUTES,
+            "bounding_box": bounding_box,
         },
     )
 
@@ -227,6 +273,7 @@ async def vessel_detail(request: Request, mmsi: int):
     if row is None:
         raise HTTPException(status_code=404, detail=f"No vessel with MMSI {mmsi}")
     threshold_ft = await asyncio.to_thread(db.get_height_threshold_ft)
+    bounding_box = await asyncio.to_thread(db.get_bounding_box)
     return templates.TemplateResponse(
         request,
         "vessel_detail.html",
@@ -235,7 +282,7 @@ async def vessel_detail(request: Request, mmsi: int):
             "height_explainer": _height_explainer(row),
             "air_draft": _air_draft_explainer(row),
             "full_table": vessel_height_table.full_table(),
-            "bounding_box": config.BOUNDING_BOX,
+            "bounding_box": bounding_box,
             "threshold_ft": threshold_ft,
         },
     )

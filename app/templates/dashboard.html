@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <title>AIS Vessel Height Monitor</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <style>
   body { font-family: system-ui, sans-serif; margin: 2rem; background: #0e1116; color: #e6e6e6; }
   h1 { font-size: 1.3rem; margin-bottom: 0.2rem; }
@@ -32,6 +34,25 @@
   .threshold-status { font-size: 0.8rem; margin-top: 0.3rem; min-height: 1.2em; }
   .threshold-status.error { color: #f87171; }
   .threshold-status.success { color: #4ade80; }
+
+  .zone-disclosure { margin-bottom: 1.4rem; border: 1px solid #232833; border-radius: 8px;
+                      padding: 0.8rem 1rem; background: #161b22; }
+  .zone-disclosure summary { cursor: pointer; color: #7db4ff; font-size: 0.9rem; user-select: none; }
+  .zone-disclosure summary:hover { text-decoration: underline; }
+  .zone-editor { display: flex; gap: 1.2rem; flex-wrap: wrap; margin-top: 1rem; align-items: flex-start; }
+  #zone-map { flex: 2 1 380px; min-width: 280px; height: 320px; border-radius: 6px;
+              border: 1px solid #232833; background: #0e1116; }
+  .zone-fields { flex: 1 1 220px; min-width: 220px; }
+  .zone-field-row { display: flex; gap: 0.8rem; margin-bottom: 0.6rem; }
+  .zone-field-row label { display: flex; flex-direction: column; font-size: 0.72rem; color: #9aa4b2;
+                           text-transform: uppercase; letter-spacing: 0.02em; gap: 0.25rem; flex: 1; }
+  .zone-field-row input { background: #0e1116; border: 1px solid #232833; border-radius: 4px; color: #e6e6e6;
+                           padding: 0.3rem 0.4rem; font-size: 0.85rem; width: 100%; box-sizing: border-box; }
+  .zone-actions { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.4rem; }
+  .zone-actions button { background: #1c2530; border: 1px solid #2b3a55; border-radius: 4px; color: #7db4ff;
+                          padding: 0.3rem 0.8rem; font-size: 0.85rem; cursor: pointer; }
+  .zone-actions button:hover { background: #2b3a55; }
+  .zone-hint { font-size: 0.75rem; color: #9aa4b2; margin-top: 0.6rem; }
 </style>
 </head>
 <body>
@@ -46,6 +67,33 @@
     showing vessels seen in the last {{ silence_window_minutes|int }} min
   </div>
   <div id="threshold-status" class="threshold-status"></div>
+
+  <details class="zone-disclosure">
+    <summary>Edit monitoring zone</summary>
+    <div class="zone-editor">
+      <div id="zone-map"></div>
+      <div class="zone-fields">
+        <div class="zone-field-row">
+          <label>SW lat <input type="number" id="zone-sw-lat" step="0.0001"></label>
+          <label>SW lon <input type="number" id="zone-sw-lon" step="0.0001"></label>
+        </div>
+        <div class="zone-field-row">
+          <label>NE lat <input type="number" id="zone-ne-lat" step="0.0001"></label>
+          <label>NE lon <input type="number" id="zone-ne-lon" step="0.0001"></label>
+        </div>
+        <div class="zone-actions">
+          <button id="zone-save" type="button">Set zone</button>
+        </div>
+        <div id="zone-status" class="threshold-status"></div>
+        <div class="zone-hint">
+          Drag the two corner markers on the map, or type coordinates directly - both stay in sync.
+          Red dots are vessels currently being tracked. Setting a new zone reconnects the AIS feed
+          immediately; vessels outside it stop updating and drop off the dashboard after
+          {{ silence_window_minutes|int }} min, same as any vessel that goes quiet.
+        </div>
+      </div>
+    </div>
+  </details>
 
   <table>
     <thead>
@@ -87,7 +135,11 @@
     </tbody>
   </table>
 
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
+let latestVessels = {{ vessels | tojson }};
+
 function badge(status) {
   return `<span class="badge badge-${status}">${status}</span>`;
 }
@@ -152,11 +204,145 @@ async function poll() {
   try {
     const resp = await fetch("/api/vessels");
     const vessels = await resp.json();
+    latestVessels = vessels;
     render(vessels);
+    updateZoneMapVessels(vessels);
   } catch (e) {
     console.error("poll failed", e);
   }
 }
+
+// --- Monitoring zone editor -------------------------------------------
+// A Leaflet map with two draggable corner markers (SW/NE) plus a rectangle
+// between them, kept in sync with the four coordinate inputs in both
+// directions - drag a marker and the inputs update, type in a field and the
+// map updates. Initialized lazily on first expanding the <details> rather
+// than at page load: Leaflet can't correctly size a map whose container is
+// still display:none (which <details> imposes on its content until opened).
+let zoneMap = null, zoneSwMarker = null, zoneNeMarker = null, zoneRect = null, zoneVesselLayer = null;
+
+function zoneInputs() {
+  return {
+    swLat: document.getElementById("zone-sw-lat"),
+    swLon: document.getElementById("zone-sw-lon"),
+    neLat: document.getElementById("zone-ne-lat"),
+    neLon: document.getElementById("zone-ne-lon"),
+  };
+}
+
+function syncZoneInputsFromMarkers() {
+  const sw = zoneSwMarker.getLatLng(), ne = zoneNeMarker.getLatLng();
+  zoneRect.setBounds([sw, ne]);
+  const f = zoneInputs();
+  f.swLat.value = sw.lat.toFixed(5);
+  f.swLon.value = sw.lng.toFixed(5);
+  f.neLat.value = ne.lat.toFixed(5);
+  f.neLon.value = ne.lng.toFixed(5);
+}
+
+function syncZoneMarkersFromInputs() {
+  if (!zoneMap) return;
+  const f = zoneInputs();
+  const swLat = parseFloat(f.swLat.value), swLon = parseFloat(f.swLon.value);
+  const neLat = parseFloat(f.neLat.value), neLon = parseFloat(f.neLon.value);
+  if ([swLat, swLon, neLat, neLon].some(v => !Number.isFinite(v))) return;
+  zoneSwMarker.setLatLng([swLat, swLon]);
+  zoneNeMarker.setLatLng([neLat, neLon]);
+  zoneRect.setBounds([[swLat, swLon], [neLat, neLon]]);
+}
+
+function updateZoneMapVessels(vessels) {
+  if (!zoneVesselLayer) return;
+  zoneVesselLayer.clearLayers();
+  vessels.forEach(v => {
+    if (v.lat == null || v.lon == null) return;
+    L.circleMarker([v.lat, v.lon], { radius: 3, color: "#f87171", weight: 1, fillColor: "#f87171", fillOpacity: 0.8 })
+      .bindTooltip(v.name)
+      .addTo(zoneVesselLayer);
+  });
+}
+
+function initZoneMapIfNeeded() {
+  if (zoneMap) {
+    zoneMap.invalidateSize();  // re-measure in case the container's size changed while hidden
+    return;
+  }
+  const bbox = {{ bounding_box | tojson }};
+  const sw = L.latLng(bbox[0][0], bbox[0][1]);
+  const ne = L.latLng(bbox[1][0], bbox[1][1]);
+
+  zoneMap = L.map("zone-map");
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }).addTo(zoneMap);
+
+  zoneRect = L.rectangle([sw, ne], { color: "#e930ff", weight: 2, fill: false, dashArray: "6,4" }).addTo(zoneMap);
+  zoneSwMarker = L.marker(sw, { draggable: true, title: "South-west corner - drag to resize the zone" }).addTo(zoneMap);
+  zoneNeMarker = L.marker(ne, { draggable: true, title: "North-east corner - drag to resize the zone" }).addTo(zoneMap);
+  zoneVesselLayer = L.layerGroup().addTo(zoneMap);
+
+  zoneSwMarker.on("drag", syncZoneInputsFromMarkers);
+  zoneNeMarker.on("drag", syncZoneInputsFromMarkers);
+  syncZoneInputsFromMarkers();
+  updateZoneMapVessels(latestVessels);
+
+  zoneMap.fitBounds(zoneRect.getBounds(), { padding: [40, 40] });
+  // <details> is still mid-expand when the "toggle" event fires - the
+  // container's final size isn't settled yet, so Leaflet's initial tile
+  // layout comes out wrong without this.
+  setTimeout(() => zoneMap.invalidateSize(), 0);
+
+  Object.values(zoneInputs()).forEach(input => input.addEventListener("input", syncZoneMarkersFromInputs));
+}
+
+document.querySelector(".zone-disclosure").addEventListener("toggle", function () {
+  if (this.open) initZoneMapIfNeeded();
+});
+
+function setZoneStatus(message, cls) {
+  const el = document.getElementById("zone-status");
+  el.textContent = message;
+  el.className = "threshold-status" + (cls ? ` ${cls}` : "");
+}
+
+async function saveZone() {
+  const f = zoneInputs();
+  const swLat = parseFloat(f.swLat.value), swLon = parseFloat(f.swLon.value);
+  const neLat = parseFloat(f.neLat.value), neLon = parseFloat(f.neLon.value);
+  if ([swLat, swLon, neLat, neLon].some(v => !Number.isFinite(v))) {
+    setZoneStatus("Enter valid coordinates for all four fields.", "error");
+    return;
+  }
+  if (swLat >= neLat || swLon >= neLon) {
+    setZoneStatus("South-west corner must be south and west of the north-east corner.", "error");
+    return;
+  }
+  // Reconnects the live AIS feed immediately (see ais_client.request_reconnect)
+  // - worth a confirm click since it briefly interrupts ingestion and changes
+  // what the whole dashboard is watching, not just a display preference.
+  if (!confirm(`Set the monitoring zone to SW(${swLat}, ${swLon}) → NE(${neLat}, ${neLon})? This reconnects the AIS feed immediately.`)) {
+    return;
+  }
+  try {
+    const resp = await fetch("/api/settings/monitoring-zone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sw_lat: swLat, sw_lon: swLon, ne_lat: neLat, ne_lon: neLon }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      const detail = Array.isArray(err.detail) ? err.detail.map(d => d.msg).join("; ") : (err.detail || resp.statusText);
+      setZoneStatus(`Failed: ${detail}`, "error");
+      return;
+    }
+    setZoneStatus("Monitoring zone updated - AIS stream reconnecting now.", "success");
+  } catch (e) {
+    setZoneStatus(`Failed: ${e}`, "error");
+  }
+}
+
+document.getElementById("zone-save").addEventListener("click", saveZone);
 
 function setThresholdStatus(message, cls) {
   const el = document.getElementById("threshold-status");

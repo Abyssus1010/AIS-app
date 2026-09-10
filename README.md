@@ -106,16 +106,28 @@ sea). AISStream only supports a rectangular bounding box subscription, so
 the rectangle covers some area outside the cone as well as the cone itself;
 nothing inside the rectangle is filtered out further.
 
-Override it with `AIS_BOUNDING_BOX` (see Configuration below) if the zone
-needs to move or resize - it's just `[[sw_lat, sw_lon], [ne_lat, ne_lon]]`.
+`AIS_BOUNDING_BOX` (see Configuration below) only sets the *default* zone
+used the first time the app ever runs against a given DB - from then on,
+the live zone is user-adjustable straight from the dashboard's "Edit
+monitoring zone" panel (drag the two corner markers on its map, or type
+coordinates directly - both stay in sync), persists in the DB across
+restarts, and takes effect immediately by forcing an AIS reconnect
+(`app/ais_client.py`'s `request_reconnect`) rather than waiting for the
+current connection to drop on its own. Same idea for the height flag
+threshold - the dashboard's threshold field next to "Flagging vessels with
+a height >" edits the live, DB-backed value, not the `HEIGHT_THRESHOLD_FT`
+env var directly (see `app/db.py`'s `get_height_threshold_ft`/
+`set_height_threshold_ft` and `get_bounding_box`/`set_bounding_box`).
 
 ### Requires
 
-`websockets`, `python-dotenv`, `fastapi`, `uvicorn[standard]`, `jinja2`, and
-`requests` (for the MMSI-to-name search fallback). `requirements.txt` also
-lists `beautifulsoup4`, `pypdf`, `pymupdf`, `pytesseract`, and `pillow` -
-those are only needed by the standalone `air_draft_lookup.py` script below,
-not by `app/` itself, which no longer fetches or OCRs pages.
+`websockets`, `python-dotenv`, `fastapi`, `uvicorn[standard]`, `jinja2`,
+`requests` (for the MMSI-to-name search fallback), `beautifulsoup4`,
+`pypdf`, `pymupdf`, `pytesseract`, and `pillow` - the last five are for
+`app/air_draft_resolver.py`'s web-search air draft lookup (fetching and, for
+scanned PDFs, OCR'ing ship-particulars pages), which needs the `tesseract-ocr`
+system package too (see the Dockerfile). The standalone `air_draft_lookup.py`
+script below shares this same set of dependencies.
 
 ### Configuration
 
@@ -129,8 +141,8 @@ All other variables are optional (defaults live in `app/config.py`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AIS_BOUNDING_BOX` | rectangle enclosing the Changi cone (see above) | `[[sw_lat, sw_lon], [ne_lat, ne_lon]]` for the AIS subscription |
-| `HEIGHT_THRESHOLD_FT` | `70` | Estimated height above this (in feet) is flagged |
+| `AIS_BOUNDING_BOX` | rectangle enclosing the Changi cone (see above) | `[[sw_lat, sw_lon], [ne_lat, ne_lon]]` seed for the AIS subscription - only used the first time the app runs against a given DB; edit the live zone from the dashboard afterward |
+| `HEIGHT_THRESHOLD_FT` | `70` | Seed for the flag threshold (height above this, in feet, is flagged) - same deal, edit the live value from the dashboard afterward |
 | `SILENCE_WINDOW_MINUTES` | `30` | How long a vessel stays on the dashboard after its last position report |
 | `LOOKUP_CONCURRENCY` | `3` | Number of concurrent MMSI-to-name lookup workers |
 | `AIR_DRAFT_LOOKUP_ENABLED` | `true` | Master switch for the web-search air draft lookup (`app/air_draft_resolver.py`) - set `false` to rely on the type+size table alone |
