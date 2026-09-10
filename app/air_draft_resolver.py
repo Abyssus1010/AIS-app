@@ -1,14 +1,33 @@
-"""Air draft resolver for the web app: ported from the standalone
-air_draft_lookup.py CLI tool, with the Playwright/JS-render fallback and the
-Windows/conda tesseract path shim dropped (this only ever runs inside the
-Linux container), and structured LookupResult return values instead of
-print()/file logging.
+"""Air draft resolver: searches the web for a vessel's own published air
+draft (height above the waterline) before worker.run_air_draft_lookup falls
+back to vessel_height_table's generic type+size estimate for that vessel.
+Reinstated after a stretch where the app relied on the type+size table
+alone - see git history (pre-b56a42c) for the original, self-contained
+version of this file, and vessel_name_lookup.py's docstring for how MMSI-to-
+name resolution split off from it as a separate concern.
 
-See air_draft_lookup.py's module docstring for the full rationale behind the
-approach (why air draft isn't on VesselFinder/MarineTraffic, why plain draft
-is never accepted as a fallback, why scanned PDFs need OCR).
+Ported from the standalone air_draft_lookup.py CLI tool, with the
+Playwright/JS-render fallback and the Windows/conda tesseract path shim
+dropped (this only ever runs inside the Linux container - see the
+Dockerfile's tesseract-ocr system package), and structured LookupResult
+return values instead of print()/file logging.
+
+Search backend: delegated entirely to vessel_name_lookup.langsearch_search /
+.duckduckgo_search (LangSearch primary, DuckDuckGo fallback) rather than
+this module making its own HTTP calls to either - both are also called by
+the name/IMO/category lookups, and LangSearch's rate limit is tight enough
+that two independently-throttled callers routinely trip 429s against each
+other (see vessel_name_lookup._throttle's docstring); going through the same
+shared throttle avoids reintroducing that exact problem for what would
+otherwise be this module's own, uncoordinated search calls.
+
+This module only owns what's genuinely specific to air draft: fetching a
+candidate page or PDF (with OCR fallback for scanned ship-particulars
+sheets), searching its text for an air-draft figure, and confirming the
+figure actually belongs to the target vessel (not a same-named other one).
 """
 
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -22,7 +41,10 @@ from bs4 import BeautifulSoup
 from PIL import Image
 from pypdf import PdfReader
 
-from app import config
+from app import db
+from app.vessel_name_lookup import duckduckgo_search, langsearch_search
+
+logger = logging.getLogger(__name__)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,29 +78,28 @@ FALLBACK_KEYWORDS = [
 VALUE_PATTERN = re.compile(r"(\d[\d,]*\.?\d*)\s*(m|meters|metres|ft|feet)\b", re.IGNORECASE)
 STANDALONE_VALUE_PATTERN = re.compile(r"^[\d,]+\.?\d*\s*(m|meters|metres|ft|feet)$", re.IGNORECASE)
 
+# The vessel name is quoted as an exact phrase - tested head-to-head against
+# LangSearch (see PR discussion): the quoted-name query surfaced the actual
+# ship-particulars PDF; unquoted-name and IMO-number-only variants
+# ("IMO 1234567 air draft", "1234567 air draft") did not return it at all,
+# just unrelated vessels. IMO is a strong *confirmation* signal once a
+# candidate page is fetched (see find_matches), but not a useful search term
+# on this backend.
 SEARCH_QUERIES = [
-    "{name} air draft",
-    "{name} air draught",
-    "{name} ship pdf",
+    '"{name}" air draft',
+    '"{name}" air draught',
+    '"{name}" ship pdf',
 ]
 
-MAX_RESULTS_PER_QUERY = 5
+MAX_RESULTS_PER_QUERY = 8
 MAX_PAGES_TO_FETCH = 12
 
-# Vessel-database sites (VesselFinder, MarineTraffic, etc.) consistently
-# title their per-ship pages "NAME, Type - ... - IMO x, MMSI y - Site", so
-# the vessel name is reliably the first comma/dash-delimited segment - except
-# some sites (MarineTraffic observed in practice) inject a stray space into
-# the name in the <title> itself (e.g. "GR ANDE SHANGHAI"), so a title match
-# alone isn't trustworthy. URL slugs are cleaner and often embed the MMSI
-# right next to the name (e.g. ".../grande-shanghai-mmsi-247416200-imo-...",
-# ".../mmsi:247416200/.../vessel:GRANDE_SHANGHAI") - prefer those when the
-# MMSI in the URL confirms the match, and only fall back to a title guess
-# when no URL yields a confirmed one.
-NAME_TITLE_SPLIT_PATTERN = re.compile(r"\s*[,–—-]\s*")
-TITLE_IMO_PATTERN = re.compile(r"IMO\s*[:#]?\s*(\d{7})", re.IGNORECASE)
-URL_SLUG_MMSI_PATTERN = re.compile(r"/([a-z0-9]+(?:-[a-z0-9]+)+)-mmsi-(\d+)(?:-imo-(\d+))?", re.IGNORECASE)
-MAX_RESOLVED_NAME_LENGTH = 60
+# Courtesy delay between fetching different candidate pages (VesselFinder,
+# PDFs, forum posts, etc.) - a separate concern from the LangSearch/
+# DuckDuckGo *search-call* throttling handled inside vessel_name_lookup, this
+# just avoids hammering whatever arbitrary external host each candidate URL
+# happens to be on back-to-back.
+PAGE_FETCH_DELAY_SECONDS = 1.5
 
 FT_PER_M = 1 / 0.3048
 
@@ -99,87 +120,43 @@ class LookupResult:
     source_url: str | None
     source_title: str | None
     context: str | None
+    # How the fetched page was confirmed to be about the target vessel:
+    # "declared_name" (the page's own NAME: field) and "imo" (the target's
+    # IMO appears next to the match) are strong; "name_proximity" is weak -
+    # only the vessel's name appears nearby, which collides readily on
+    # short/common names (see find_matches). None for an UNKNOWN with no
+    # source at all.
+    identity: Literal["declared_name", "imo", "name_proximity", "unconfirmed"] | None = None
 
 
-def duckduckgo_search(query: str, max_results: int = MAX_RESULTS_PER_QUERY):
-    resp = requests.post(
-        "https://html.duckduckgo.com/html/",
-        data={"q": query},
-        headers={"User-Agent": USER_AGENT},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    results = []
-    for a in soup.select("a.result__a"):
-        href = a.get("href")
-        title = a.get_text(strip=True)
-        if href:
-            results.append((title, href))
-        if len(results) >= max_results:
-            break
-    return results
-
-
-def _name_from_url(url: str, mmsi: int) -> tuple[str, int | None] | None:
-    match = URL_SLUG_MMSI_PATTERN.search(url)
-    if match and match.group(2) == str(mmsi):
-        name = match.group(1).replace("-", " ").upper()
-        imo = int(match.group(3)) if match.group(3) else None
-        return name, imo
-
-    fields = {}
-    for segment in url.split("/"):
-        for key in ("mmsi", "imo", "vessel"):
-            prefix = f"{key}:"
-            if segment.lower().startswith(prefix):
-                fields[key] = segment[len(prefix):]
-    if fields.get("mmsi") == str(mmsi) and fields.get("vessel"):
-        name = fields["vessel"].replace("_", " ").replace("-", " ").strip().upper()
-        imo = int(fields["imo"]) if fields.get("imo", "").isdigit() else None
-        return name, imo
-    return None
-
-
-def _name_from_title(title: str) -> tuple[str, int | None] | None:
-    name = NAME_TITLE_SPLIT_PATTERN.split(title, maxsplit=1)[0]
-    name = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip(" \"'")
-    if not name or name.isdigit() or len(name) > MAX_RESOLVED_NAME_LENGTH:
-        return None
-    imo_match = TITLE_IMO_PATTERN.search(title)
-    return name, (int(imo_match.group(1)) if imo_match else None)
-
-
-def resolve_vessel_name(mmsi: int) -> tuple[str, int | None] | None:
-    """Looks up a vessel's name (and IMO, if available) from its MMSI alone,
-    for vessels AIS hasn't yet delivered a static-data message for. Reads
-    DuckDuckGo's own search results rather than fetching the target page:
-    vessel-database sites like VesselFinder/MarineTraffic are commonly
-    Cloudflare-blocked for direct fetches (see air_draft_lookup.py's
-    docstring), but the result listing itself is enough.
-
-    Only returns a name when the searched-for MMSI is actually confirmed
-    somewhere in that result (its URL or its title) - an unconfirmed guess
-    (e.g. an unrelated page that happens to rank for the query) risks
-    silently mislabeling the vessel, which is worse than leaving it PENDING
-    for another retry. In testing, real MMSIs consistently resolve via a
-    confirmed match, so this doesn't cost much recall."""
-    try:
-        results = duckduckgo_search(f"MMSI {mmsi}", max_results=5)
-    except Exception:
-        return None
-
-    for title, url in results:
-        from_url = _name_from_url(url, mmsi)
-        if from_url:
-            return from_url
-
-        if str(mmsi) in title:
-            from_title = _name_from_title(title)
-            if from_title:
-                return from_title
-    return None
+def _search_candidates(vessel_name: str) -> list[tuple[str, str]]:
+    """Runs every SEARCH_QUERIES template through LangSearch, falling back to
+    DuckDuckGo per-query if LangSearch errors out - same fallback pattern as
+    vessel_name_lookup.resolve_vessel_name, just repeated across more
+    queries. Returns deduplicated (title, url) pairs across all queries;
+    snippets aren't used here (unlike name resolution) since this module
+    fetches and parses each candidate's full page text instead."""
+    seen_urls = set()
+    candidates = []
+    for template in SEARCH_QUERIES:
+        query = template.format(name=vessel_name)
+        try:
+            results = langsearch_search(query, max_results=MAX_RESULTS_PER_QUERY)
+        except Exception:
+            logger.warning(
+                "LangSearch air-draft search failed for query %r, falling back to DuckDuckGo",
+                query, exc_info=True,
+            )
+            try:
+                results = duckduckgo_search(query, max_results=MAX_RESULTS_PER_QUERY)
+            except Exception:
+                logger.warning("DuckDuckGo fallback also failed for query %r", query, exc_info=True)
+                continue
+        for title, url, _snippet in results:
+            if url not in seen_urls:
+                seen_urls.add(url)
+                candidates.append((title, url))
+    return candidates
 
 
 def fetch_pdf_text(content: bytes) -> str:
@@ -276,6 +253,10 @@ def find_value_near(lines, i: int, same_line_start: int):
 NAME_PROXIMITY_LINES = 100
 
 
+def _normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _name_pattern(vessel_name: str) -> re.Pattern:
     """Whitespace-flexible, case-insensitive pattern matching vessel_name as
     a phrase (not just its words appearing anywhere)."""
@@ -347,16 +328,53 @@ def _extract_declared_name(text: str) -> str | None:
     return None
 
 
-def find_matches(text: str, vessel_name: str | None = None):
+def _imo_pattern(imo: int) -> re.Pattern:
+    """Whole-number match for a 7-digit IMO number - bounded on both sides by
+    non-digits so it can't match as a substring of some longer number (e.g.
+    a phone number, or a different vessel's ENI/callsign that happens to
+    embed the same 7 digits)."""
+    return re.compile(r"(?<!\d)" + re.escape(str(imo)) + r"(?!\d)")
+
+
+def find_matches(text: str, vessel_name: str | None = None, imo: int | None = None):
     lines = [line.rstrip() for line in text.splitlines()]
     name_re = _name_pattern(vessel_name) if vessel_name else None
+    imo_re = _imo_pattern(imo) if imo else None
+
+    # Set when the document's own declared-name field confirms identity for
+    # the whole document (see below) - every hit found under that condition
+    # is tagged "declared_name" rather than going through the per-hit check.
+    doc_identity = None
 
     if vessel_name:
         declared_name = _extract_declared_name(text)
-        if declared_name is not None:
-            if declared_name.upper() != _normalize_ws(vessel_name).upper():
-                return []
+        if declared_name is not None and declared_name.upper() == _normalize_ws(vessel_name).upper():
             name_re = None  # document's own declared name already confirms identity
+            doc_identity = "declared_name"
+        elif imo_re is not None and not imo_re.search(text):
+            # No declared-name field confirms this document as ours (either
+            # there isn't one, or it names a different vessel) - and we know
+            # this vessel's IMO, yet it doesn't appear anywhere in the
+            # document at all. A bare name-proximity match alone is too weak
+            # to trust in that situation: a short/common vessel name (e.g.
+            # "ESSENCE") readily collides with unrelated content that just
+            # happens to be about a same-named *something else* - a yacht
+            # brand's own product page, in one observed case, complete with
+            # its own genuine "Air draft" spec for an unrelated small boat.
+            # Real ship-particulars documents (what this tool actually
+            # targets) essentially always state the IMO alongside other
+            # specs, so this costs little real recall - it mainly screens
+            # out exactly this kind of coincidental name collision. (When
+            # the IMO is unknown, there's nothing to cross-check with, so
+            # this check is skipped entirely and name-proximity remains the
+            # only available signal, same as before.)
+            return []
+        # else: either the document declares a different vessel but our IMO
+        # does appear somewhere in it (e.g. a fleet sheet listing several
+        # sister ships, ours included further down), or IMO is unknown to us
+        # entirely - fall through to the per-hit name-OR-IMO proximity check
+        # below, so a hit is only accepted if OUR name or IMO is actually
+        # near it.
 
     hits = []
     for i, raw_line in enumerate(lines):
@@ -385,13 +403,18 @@ def find_matches(text: str, vessel_name: str | None = None):
             continue
 
         if name_re is not None:
-            window = lines[max(0, i - NAME_PROXIMITY_LINES): i + NAME_PROXIMITY_LINES]
-            if not _name_confirmed_nearby("\n".join(window), name_re):
+            window = "\n".join(lines[max(0, i - NAME_PROXIMITY_LINES): i + NAME_PROXIMITY_LINES])
+            name_ok = _name_confirmed_nearby(window, name_re)
+            imo_ok = imo_re is not None and imo_re.search(window) is not None
+            if not name_ok and not imo_ok:
                 continue
+            identity = "imo" if imo_ok else "name_proximity"
+        else:
+            identity = doc_identity or "unconfirmed"
 
         value = find_value_near(lines, i, end_idx)
         context = " | ".join(c.strip() for c in lines[max(0, i - 1): i + 3] if c.strip())
-        hits.append({"line": stripped, "value": value, "context": context, "tier": tier})
+        hits.append({"line": stripped, "value": value, "context": context, "tier": tier, "identity": identity})
     return hits
 
 
@@ -425,26 +448,8 @@ def _fetch_text(url: str) -> str:
     return BeautifulSoup(resp.text, "html.parser").get_text("\n", strip=True)
 
 
-def _normalize_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def resolve_air_draft(vessel_name: str) -> LookupResult:
-    seen_urls = set()
-    candidates = []
-    for i, template in enumerate(SEARCH_QUERIES):
-        if i > 0:
-            time.sleep(config.DDG_REQUEST_DELAY_SECONDS)
-        query = template.format(name=vessel_name)
-        try:
-            results = duckduckgo_search(query)
-        except Exception:
-            continue
-        for title, url in results:
-            if url not in seen_urls:
-                seen_urls.add(url)
-                candidates.append((title, url))
-
+def resolve_air_draft(vessel_name: str, imo: int | None = None) -> LookupResult:
+    candidates = _search_candidates(vessel_name)
     if not candidates:
         raise LookupError(f"no search results for {vessel_name!r}")
 
@@ -454,34 +459,45 @@ def resolve_air_draft(vessel_name: str) -> LookupResult:
 
     for idx, (title, url) in enumerate(candidates[:MAX_PAGES_TO_FETCH]):
         if idx > 0:
-            time.sleep(config.DDG_REQUEST_DELAY_SECONDS)
+            time.sleep(PAGE_FETCH_DELAY_SECONDS)
         try:
             text = _fetch_text(url)
         except Exception:
             continue
         any_fetch_succeeded = True
 
-        for hit in find_matches(text, vessel_name):
+        for hit in find_matches(text, vessel_name, imo):
             if hit["value"]:
                 parsed = parse_value_to_m_ft(hit["value"])
                 if parsed:
                     meters, feet = parsed
-                    status = "FLAGGED" if feet > config.AIR_DRAFT_THRESHOLD_FT else "OK"
-                    result = LookupResult(status, hit["value"], meters, feet, url, title, hit["context"])
+                    status = "FLAGGED" if feet > db.get_height_threshold_ft() else "OK"
+                    result = LookupResult(
+                        status, hit["value"], meters, feet, url, title, hit["context"], hit["identity"]
+                    )
                     if hit["tier"] == "primary":
                         return result
                     if fallback_hit is None:
                         fallback_hit = result
                     continue
-            if keyword_only_hit is None:
-                keyword_only_hit = (url, title, hit["context"])
+            # A value-less hit is already the weakest kind of evidence (a
+            # bare keyword with no parsed number), so it's only surfaced as
+            # a "check this by hand" source when identity is confirmed by a
+            # strong signal (the document's own declared name, or a matching
+            # IMO) - not by name-proximity alone, which false-positives
+            # readily on a short/common vessel name (e.g. "FOREVER") next to
+            # an unrelated use of a keyword like "air draught" (which is
+            # also just ordinary British English for a cold air current -
+            # see e.g. draught-excluder/weatherstripping product listings).
+            if keyword_only_hit is None and hit["identity"] in ("declared_name", "imo"):
+                keyword_only_hit = (url, title, hit["context"], hit["identity"])
 
     if fallback_hit:
         return fallback_hit
 
     if keyword_only_hit:
-        url, title, context = keyword_only_hit
-        return LookupResult("UNKNOWN", None, None, None, url, title, context)
+        url, title, context, identity = keyword_only_hit
+        return LookupResult("UNKNOWN", None, None, None, url, title, context, identity)
 
     if not any_fetch_succeeded:
         raise LookupError(f"all page fetches failed for {vessel_name!r}")

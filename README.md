@@ -1,20 +1,36 @@
 # AIS app
 
-An air draft monitor for vessels in Singapore's eastern approaches. It
-watches live AIS traffic, looks up each vessel's air draft (height above the
-waterline) on the open web, and flags any vessel tall enough to be a hazard
-to aircraft using Changi's runways - on a live-updating dashboard.
+A height monitor for vessels in Singapore's eastern approaches. It watches
+live AIS traffic, estimates each vessel's height above the waterline from its
+AIS-broadcast type and length, and flags any vessel tall enough to be a
+hazard to aircraft using Changi's runways - on a live-updating dashboard.
+
+Each vessel's height is resolved two ways, in order. First, a web search for
+the vessel's own published air draft (fetching ship-particulars pages/PDFs,
+OCR'ing scanned ones - `app/air_draft_resolver.py`). A genuine,
+publicly-published air draft figure only exists for a minority of vessels
+however thorough the search, so this was dropped for a stretch in favor of
+the second method alone; it's since been reinstated as a first pass rather
+than the sole method, specifically so its occasional real per-vessel
+precision isn't left on the table. Whatever it can't confirm falls back
+instantly to a preset type+size table (`app/vessel_height_table.py`) driven
+by AIS-broadcast type and length alone - no network call, no per-vessel
+search, and available for every vessel with AIS static data. See that
+module's docstring for the table itself and its confidence caveats, and
+`app/worker.py`'s `run_air_draft_lookup` for how the two are sequenced.
 
 The repo has two parts:
 
 - **`app/`** - the actual service: a FastAPI app that ingests AIS, persists
-  vessel state, resolves air drafts in the background, and serves the
-  dashboard. This is what `Dockerfile`/`docker-compose.yml` build and run.
+  vessel state, estimates height from type+size, and serves the dashboard.
+  This is what `Dockerfile`/`docker-compose.yml` build and run.
 - **`aisstream.py`** and **`air_draft_lookup.py`** - two standalone, independent
   scripts kept at the repo root for quick manual testing. `app/ais_client.py`
-  and `app/air_draft_resolver.py` are productionized ports of these (adding
-  DB persistence, structured results, retries) - see each script's own
-  section below for what they do on their own.
+  began as a productionized port of `aisstream.py` (adding DB persistence);
+  `app/air_draft_resolver.py` is likewise a productionized port of
+  `air_draft_lookup.py` (LangSearch as primary search backend instead of
+  DuckDuckGo alone, structured results instead of print()/file output). See
+  each script's own section below for what they do on their own.
 
 ---
 
@@ -25,22 +41,38 @@ The repo has two parts:
 1. **Ingests** live AIS position + static-data messages from
    [aisstream.io](https://aisstream.io) for a configured monitoring zone
    (`app/ais_client.py`), reconnecting with backoff on drops.
-2. **Persists** every vessel's latest position and identity to a local
-   SQLite DB (`app/db.py`).
-3. The first time a vessel's name becomes known, it's **queued for an air
-   draft lookup** (`app/worker.py` + `app/air_draft_resolver.py`), which
-   searches the web, fetches pages/PDFs (OCR'ing scanned ones), and marks
-   the vessel `OK`, `FLAGGED` (air draft over threshold), or `UNKNOWN` (no
-   public source found). Before accepting a match, it checks the fetched
-   page really is about the target vessel - a document's own declared
-   `NAME:` field (common on ship particulars sheets) takes priority when
-   present, since a page can otherwise look relevant while actually
-   describing a different, similarly-named vessel (e.g. searching
-   "NORTHWIND" surfacing a document for "INCE NORTHWIND", a different ship).
-   Failed lookups and stale `UNKNOWN`s are automatically retried on a sweep.
-4. Serves a **dashboard** (`app/main.py` + `app/templates/dashboard.html`)
-   listing every vessel seen recently, sorted with `FLAGGED` vessels first.
-   It polls `GET /api/vessels` every 10s to stay live.
+2. **Persists** every vessel's latest position, identity, AIS type, and
+   length overall (LOA) to a local SQLite DB (`app/db.py`).
+3. The moment a vessel's AIS type and LOA are known, its height is
+   **estimated instantly from a preset type+size table**
+   (`app/vessel_height_table.py`) - no network call, no per-vessel search.
+   The vessel is marked `OK`, `FLAGGED` (estimated height over
+   `HEIGHT_THRESHOLD_FT`), or `UNKNOWN` (type/LOA not yet known, or a type
+   the table doesn't cover, e.g. sailing vessels whose height is set by mast
+   rigging rather than hull size). See that module's docstring for why
+   several categories carry a `low` confidence estimate.
+4. Separately, once a vessel has a name, `app/worker.py`'s
+   `run_air_draft_lookup` **searches the web for that vessel's own published
+   air draft** (`app/air_draft_resolver.py`) - LangSearch, falling back to
+   DuckDuckGo, for ship-particulars pages/PDFs (OCR'd if scanned), confirmed
+   against the vessel's own name/IMO before being trusted. A confirmed
+   result *overrides* the type+size table's estimate for that vessel's
+   `OK`/`FLAGGED` verdict (`app/main.py`'s `_effective_height`); anything
+   this can't confirm just leaves the table estimate as the vessel's
+   verdict, which was already computed for free in step 3. This is far more
+   expensive per vessel than every other lookup here (up to 3 search
+   queries, each fanning out to a dozen page/PDF fetches) - see
+   `AIR_DRAFT_LOOKUP_ENABLED`/`AIR_DRAFT_RETRY_HOURS` below to disable it or
+   tune its retry backoff.
+5. Serves a **dashboard** (`app/main.py` + `app/templates/dashboard.html`)
+   listing every vessel seen recently, sorted with `FLAGGED` vessels first,
+   and a **vessel detail page** that visually breaks down how each estimate
+   was derived (type → category → size bracket → table value → threshold
+   verdict). The dashboard polls `GET /api/vessels` every 10s to stay live.
+6. Separately, **vessels with no name at all** (AIS hasn't yet delivered a
+   static-data message for them - only position reports so far, shown on the
+   dashboard as `MMSI <n>`) are queued for a best-effort name guess from the
+   MMSI alone (`app/worker.py` + `app/vessel_name_lookup.py`) - see below.
 
 ### Vessel lifecycle: visibility vs. retries
 
@@ -52,28 +84,18 @@ The repo has two parts:
   distinguish that from an AIS coverage gap, the vessel's transponder going
   quiet, or a brief reconnect after a dropped stream - it only knows "no
   message arrived recently," not why.
-- **Air draft retries are scoped to the same visibility window as the
+- The height estimate itself needs no retry logic - it's recomputed
+  synchronously every time a static-data message updates a vessel's type or
+  LOA, so it's never stale beyond the AIS feed's own latency.
+- **Name-guess retries are scoped to the same visibility window as the
   dashboard.** The background sweep (`app/worker.py`, every 10 minutes) only
-  re-queues a vessel if it's also within `SILENCE_WINDOW_MINUTES` - a vessel
-  that's gone quiet longer than that won't be retried until it's heard from
-  again, so workers aren't spent re-resolving vessels nobody can currently
-  see.
-- Within that sweep, `PENDING` vessels (a lookup failed outright - the search
-  or every page fetch errored) are retried on the very next sweep, with no
-  delay. `UNKNOWN` vessels (a lookup completed but found nothing conclusive)
-  are only retried once `last_checked_at` is older than
-  `UNKNOWN_RETRY_HOURS`.
-- **Vessels with no name at all** (AIS hasn't yet delivered a static-data
-  message for them - only position reports so far, shown on the dashboard as
-  `MMSI <n>`) are handled separately: the same sweep also tries to resolve a
-  name from the MMSI alone (`resolve_vessel_name` in
-  `app/air_draft_resolver.py`), by reading vessel-database sites' DuckDuckGo
-  search results for one that's confirmed to reference that exact MMSI, then
-  proceeds to the normal air draft lookup using the resolved name. This is
-  best-effort and only accepts a *confirmed* match (the MMSI must actually
-  appear in that result's URL or title) - if nothing confirms, it stays
-  `PENDING` and is retried on the next sweep, same as any other pending
-  vessel, rather than risk mislabeling it with a guess.
+  re-queues a nameless vessel if it's also within `SILENCE_WINDOW_MINUTES` -
+  a vessel that's gone quiet longer than that won't be retried until it's
+  heard from again, so workers aren't spent re-resolving vessels nobody can
+  currently see. This is best-effort and only accepts a *confirmed* match
+  (the MMSI must actually appear in the search result's URL or title) - if
+  nothing confirms, the vessel stays nameless and is retried on the next
+  sweep rather than risk mislabeling it with a guess.
 
 ### Monitoring zone
 
@@ -84,17 +106,28 @@ sea). AISStream only supports a rectangular bounding box subscription, so
 the rectangle covers some area outside the cone as well as the cone itself;
 nothing inside the rectangle is filtered out further.
 
-Override it with `AIS_BOUNDING_BOX` (see Configuration below) if the zone
-needs to move or resize - it's just `[[sw_lat, sw_lon], [ne_lat, ne_lon]]`.
+`AIS_BOUNDING_BOX` (see Configuration below) only sets the *default* zone
+used the first time the app ever runs against a given DB - from then on,
+the live zone is user-adjustable straight from the dashboard's "Edit
+monitoring zone" panel (drag the two corner markers on its map, or type
+coordinates directly - both stay in sync), persists in the DB across
+restarts, and takes effect immediately by forcing an AIS reconnect
+(`app/ais_client.py`'s `request_reconnect`) rather than waiting for the
+current connection to drop on its own. Same idea for the height flag
+threshold - the dashboard's threshold field next to "Flagging vessels with
+a height >" edits the live, DB-backed value, not the `HEIGHT_THRESHOLD_FT`
+env var directly (see `app/db.py`'s `get_height_threshold_ft`/
+`set_height_threshold_ft` and `get_bounding_box`/`set_bounding_box`).
 
 ### Requires
 
-Everything in `requirements.txt` (`websockets`, `python-dotenv`, `fastapi`,
-`uvicorn[standard]`, `jinja2`, plus the lookup stack: `requests`,
-`beautifulsoup4`, `pypdf`, `pymupdf`, `pytesseract`, `pillow`), and the
-Tesseract OCR engine with English trained data for scanned PDFs (see the
-`air_draft_lookup.py` section below for the install command - same
-requirement, since `app/air_draft_resolver.py` uses the same OCR fallback).
+`websockets`, `python-dotenv`, `fastapi`, `uvicorn[standard]`, `jinja2`,
+`requests` (for the MMSI-to-name search fallback), `beautifulsoup4`,
+`pypdf`, `pymupdf`, `pytesseract`, and `pillow` - the last five are for
+`app/air_draft_resolver.py`'s web-search air draft lookup (fetching and, for
+scanned PDFs, OCR'ing ship-particulars pages), which needs the `tesseract-ocr`
+system package too (see the Dockerfile). The standalone `air_draft_lookup.py`
+script below shares this same set of dependencies.
 
 ### Configuration
 
@@ -108,12 +141,12 @@ All other variables are optional (defaults live in `app/config.py`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AIS_BOUNDING_BOX` | rectangle enclosing the Changi cone (see above) | `[[sw_lat, sw_lon], [ne_lat, ne_lon]]` for the AIS subscription |
-| `AIR_DRAFT_THRESHOLD_FT` | `70` | Air draft above this (in feet) is flagged |
+| `AIS_BOUNDING_BOX` | rectangle enclosing the Changi cone (see above) | `[[sw_lat, sw_lon], [ne_lat, ne_lon]]` seed for the AIS subscription - only used the first time the app runs against a given DB; edit the live zone from the dashboard afterward |
+| `HEIGHT_THRESHOLD_FT` | `70` | Seed for the flag threshold (height above this, in feet, is flagged) - same deal, edit the live value from the dashboard afterward |
 | `SILENCE_WINDOW_MINUTES` | `30` | How long a vessel stays on the dashboard after its last position report |
-| `UNKNOWN_RETRY_HOURS` | `1` | How long before a vessel marked `UNKNOWN` is retried |
-| `LOOKUP_CONCURRENCY` | `3` | Number of concurrent air-draft lookup workers |
-| `DDG_REQUEST_DELAY_SECONDS` | `2.0` | Delay between DuckDuckGo requests during a lookup |
+| `LOOKUP_CONCURRENCY` | `3` | Number of concurrent MMSI-to-name lookup workers |
+| `AIR_DRAFT_LOOKUP_ENABLED` | `true` | Master switch for the web-search air draft lookup (`app/air_draft_resolver.py`) - set `false` to rely on the type+size table alone |
+| `AIR_DRAFT_RETRY_HOURS` | `12` | How long to wait before retrying a vessel whose air draft search came back `UNKNOWN` |
 | `DB_PATH` | `./ais.db` | SQLite file location (Docker sets this to `/data/ais.db`) |
 
 ### Run locally
