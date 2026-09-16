@@ -83,7 +83,14 @@ _TYPE_TEXT_TO_CATEGORY: list[tuple[re.Pattern, Category]] = [
         Category.SMALL_WORKBOAT,
     ),
     (re.compile(r"\bhigh[- ]?speed craft\b", re.IGNORECASE), Category.HIGH_SPEED_CRAFT),
-    (re.compile(r"\b(sailing|yacht|pleasure)\b", re.IGNORECASE), Category.MAST_DRIVEN),
+    # "sailing" alone false-positives on MyShipTracking's boilerplate summary
+    # sentence present on every vessel's page regardless of type ("... is a
+    # Cargo It's sailing under the flag of [HK] Hong Kong") - observed in
+    # practice misclassifying real container ships (e.g. OOCL HONG KONG) as
+    # mast-driven. The negative lookahead excludes that specific "sailing
+    # under (the flag)" phrasing while still matching genuine type text like
+    # "Sailing Vessel" or bare "Sailing".
+    (re.compile(r"\b(sailing\b(?!\s+under)|yacht|pleasure)\b", re.IGNORECASE), Category.MAST_DRIVEN),
     (re.compile(r"\b(cargo|bulk|container|ro-?ro|vehicles carrier)\b", re.IGNORECASE), Category.CARGO),
 ]
 
